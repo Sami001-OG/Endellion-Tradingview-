@@ -1,0 +1,40 @@
+{
+  "enabled": true,
+  "webhookUrl": "https://web-blue-delta-17.vercel.app/api/webhooks/tradingview/6a85865848b2eab0c86861d0",
+  "signingSecret": "sami@123sami",
+  "authType": "HMAC_SHA256",
+  "customHeaderName": "x-api-key",
+  "customHeaderValue": "",
+  "formatPreset": "botx_tradingview",
+  "exchange": "bybit",
+  "autoDispatch": true,
+  "minConfidence": 50,
+  "defaultLeverage": 10,
+  "defaultSize": "0.01",
+  "dca": {
+    "enabled": true,
+    "triggerDropPercent": 3,
+    "stepDropPercent": 3,
+    "amountMode": "FIXED",
+    "amount": 25,
+    "maxSteps": 3
+  },
+  "partialTps": {
+    "enabled": true,
+    "tp1PricePercent": 2,
+    "tp1Percent": 30,
+    "tp2PricePercent": 4,
+    "tp2Percent": 30,
+    "tp3PricePercent": 8,
+    "tp3Percent": 40
+  },
+  "breakeven": {
+    "enabled": true,
+    "moveAtProfitPercent": 1.5,
+    "safeProfitPercent": 0.2
+  },
+  "trailing": {
+    "enabled": true,
+    "callbackPercent": 1.5
+  }
+}

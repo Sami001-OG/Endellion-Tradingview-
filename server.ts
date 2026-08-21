@@ -1011,8 +1011,15 @@ async function startServer() {
 
   app.post("/api/webhook/preview", (req, res) => {
     try {
-      const { signal, config } = req.body;
-      const preview = buildSignalPayload(signal, config || getWebhookConfig());
+      const { signal, config, rawPayload } = req.body;
+      const targetSignal = rawPayload ? {
+        symbol: typeof rawPayload === 'object' ? (rawPayload.symbol || 'BTCUSDT') : 'BTCUSDT',
+        direction: typeof rawPayload === 'object' ? (rawPayload.action || 'LONG') : 'LONG',
+        entryPrice: 0,
+        sl: 0,
+        customRawPayload: rawPayload,
+      } : signal;
+      const preview = buildSignalPayload(targetSignal, config || getWebhookConfig());
       res.json(preview);
     } catch (error: any) {
       res.status(400).json({ error: error.message });
@@ -1021,12 +1028,23 @@ async function startServer() {
 
   app.post("/api/webhook/send", async (req, res) => {
     try {
-      const { signal, config } = req.body;
-      if (!signal || !signal.symbol || !signal.direction) {
-        return res.status(400).json({ error: "Missing required signal data (symbol, direction, entryPrice, sl)" });
+      const { signal, config, rawPayload } = req.body;
+      let targetSignal = signal;
+      if (rawPayload) {
+        targetSignal = {
+          symbol: typeof rawPayload === 'object' ? (rawPayload.symbol || 'BTCUSDT') : 'BTCUSDT',
+          direction: typeof rawPayload === 'object' ? (rawPayload.action || 'LONG') : 'LONG',
+          entryPrice: 0,
+          sl: 0,
+          customRawPayload: rawPayload,
+        };
       }
 
-      const result = await dispatchWebhookSignal(signal, config);
+      if (!targetSignal) {
+        return res.status(400).json({ error: "Missing required signal data or rawPayload" });
+      }
+
+      const result = await dispatchWebhookSignal(targetSignal, config);
       if (result.success) {
         res.json(result);
       } else {
@@ -1503,6 +1521,28 @@ ${directionIcon} Direction: ${activeTrade.direction}
 🎯 New Averaged Entry: ${formatPrice(activeTrade.entry)}
 ❌ Stop Loss: ${formatPrice(activeTrade.sl)}`;
                   sendTelegramSignal(botToken, chatId, entryAlertMsg).catch(console.error);
+
+                  // Webhook Engine Auto-Dispatch for DCA Averaged Entry (Matches Telegram Push)
+                  try {
+                    const whConfig = getWebhookConfig();
+                    if (whConfig.enabled && whConfig.autoDispatch && whConfig.webhookUrl) {
+                      dispatchWebhookSignal({
+                        symbol: symbol,
+                        direction: 'MANAGE',
+                        eventType: 'DCA_FILLED',
+                        entryPrice: activeTrade.entry,
+                        sl: activeTrade.sl,
+                        tp1: activeTrade.tp1,
+                        tp2: activeTrade.tp2,
+                        tp3: activeTrade.tp3,
+                        confidence: activeTrade.confidence,
+                        timeframe: '15m',
+                        session: activeTrade.session,
+                      }).catch(console.error);
+                    }
+                  } catch (whErr) {
+                    console.error('[Webhook Engine DCA Error]', whErr);
+                  }
                 }
               }
 
@@ -1546,6 +1586,26 @@ ${directionIcon} Direction: ${activeTrade.direction}
                         chatId,
                         `🚨 <b>TRADE UPDATE</b> 🚨\n\n🪙 <b>Pair:</b> #${symbol}\n📈 <b>Direction:</b> LONG\n${titleText}\n⚠️ <b>Status:</b> ${subtitleText} (Price: <code>${formatPrice(slCheckVal)}</code>)\n💰 <b>PnL Secured:</b> ${pnlStr}`,
                       ).catch(console.error);
+
+                      // Webhook Engine Auto-Dispatch for SL / Break-Even (Matches Telegram Push)
+                      try {
+                        const whConfig = getWebhookConfig();
+                        if (whConfig.enabled && whConfig.autoDispatch && whConfig.webhookUrl) {
+                          dispatchWebhookSignal({
+                            symbol: symbol,
+                            direction: 'CLOSE_LONG',
+                            eventType: isBE ? 'BREAK_EVEN_HIT' : 'SL_HIT',
+                            entryPrice: slCheckVal,
+                            sl: slCheckVal,
+                            pnlPercent: pnlStr,
+                            confidence: activeTrade.confidence,
+                            timeframe: '15m',
+                            session: activeTrade.session,
+                          }).catch(console.error);
+                        }
+                      } catch (whErr) {
+                        console.error('[Webhook Engine SL Error]', whErr);
+                      }
                       
                       recordTradeResult(isBE ? "WIN" : "LOSS");
                       
@@ -1565,6 +1625,26 @@ ${directionIcon} Direction: ${activeTrade.direction}
                         chatId,
                         `🚨 <b>TRADE UPDATE</b> 🚨\n\n🪙 <b>Pair:</b> #${symbol}\n📉 <b>Direction:</b> SHORT\n${titleText}\n⚠️ <b>Status:</b> ${subtitleText} (Price: <code>${formatPrice(slCheckVal)}</code>)\n💰 <b>PnL Secured:</b> ${pnlStr}`,
                       ).catch(console.error);
+
+                      // Webhook Engine Auto-Dispatch for SL / Break-Even (Matches Telegram Push)
+                      try {
+                        const whConfig = getWebhookConfig();
+                        if (whConfig.enabled && whConfig.autoDispatch && whConfig.webhookUrl) {
+                          dispatchWebhookSignal({
+                            symbol: symbol,
+                            direction: 'CLOSE_SHORT',
+                            eventType: isBE ? 'BREAK_EVEN_HIT' : 'SL_HIT',
+                            entryPrice: slCheckVal,
+                            sl: slCheckVal,
+                            pnlPercent: pnlStr,
+                            confidence: activeTrade.confidence,
+                            timeframe: '15m',
+                            session: activeTrade.session,
+                          }).catch(console.error);
+                        }
+                      } catch (whErr) {
+                        console.error('[Webhook Engine SL Error]', whErr);
+                      }
                       
                       recordTradeResult(isBE ? "WIN" : "LOSS");
                       
@@ -1591,6 +1671,27 @@ ${directionIcon} Direction: ${activeTrade.direction}
                         chatId,
                         `🎯 <b>TAKE PROFIT 1 ACHIEVED (50% Booked)</b> 🎯\n\n🪙 <b>Pair:</b> #${symbol}\n📈 <b>Direction:</b> LONG\n✅ <b>Target 1:</b> <code>${formatPrice(activeTrade.tp1)}</code>\n💰 <b>Secured Return:</b> ${pnlSegment} (on 50% allocation)\n🛡 <b>Risk Management:</b> Stop Loss moved to Break-Even (<code>${formatPrice(activeTrade.entry)}</code>). Trade is now 100% risk-free!`,
                       ).catch(console.error);
+
+                      // Webhook Engine Auto-Dispatch for TP1 (50% booking & SL to BE)
+                      try {
+                        const whConfig = getWebhookConfig();
+                        if (whConfig.enabled && whConfig.autoDispatch && whConfig.webhookUrl) {
+                          dispatchWebhookSignal({
+                            symbol: symbol,
+                            direction: 'PARTIAL_EXIT',
+                            eventType: 'TP1_HIT',
+                            closePercent: 50,
+                            entryPrice: activeTrade.tp1,
+                            sl: activeTrade.entry,
+                            pnlPercent: pnlSegment,
+                            confidence: activeTrade.confidence,
+                            timeframe: '15m',
+                            session: activeTrade.session,
+                          }).catch(console.error);
+                        }
+                      } catch (whErr) {
+                        console.error('[Webhook Engine TP1 Error]', whErr);
+                      }
                     } 
                     if (activeTrade.hasHitTp1 && !activeTrade.hasHitTp2 && currentHigh >= activeTrade.tp2) {
                       activeTrade.hasHitTp2 = true;
@@ -1603,6 +1704,27 @@ ${directionIcon} Direction: ${activeTrade.direction}
                         chatId,
                         `🎯 <b>TAKE PROFIT 2 ACHIEVED (30% Booked)</b> 🎯\n\n🪙 <b>Pair:</b> #${symbol}\n📈 <b>Direction:</b> LONG\n✅ <b>Target 2:</b> <code>${formatPrice(activeTrade.tp2)}</code>\n💰 <b>Secured Return:</b> ${pnlSegment} (on 30% allocation)\n🏃‍♂️ <b>Next:</b> Remaining 20% position running risk-free to TP3 target!`,
                       ).catch(console.error);
+
+                      // Webhook Engine Auto-Dispatch for TP2 (30% booking)
+                      try {
+                        const whConfig = getWebhookConfig();
+                        if (whConfig.enabled && whConfig.autoDispatch && whConfig.webhookUrl) {
+                          dispatchWebhookSignal({
+                            symbol: symbol,
+                            direction: 'PARTIAL_EXIT',
+                            eventType: 'TP2_HIT',
+                            closePercent: 30,
+                            entryPrice: activeTrade.tp2,
+                            sl: activeTrade.entry,
+                            pnlPercent: pnlSegment,
+                            confidence: activeTrade.confidence,
+                            timeframe: '15m',
+                            session: activeTrade.session,
+                          }).catch(console.error);
+                        }
+                      } catch (whErr) {
+                        console.error('[Webhook Engine TP2 Error]', whErr);
+                      }
                     } 
                     if (activeTrade.hasHitTp2 && !activeTrade.hasHitTp3 && currentHigh >= activeTrade.tp3) {
                       activeTrade.hasHitTp3 = true;
@@ -1614,6 +1736,27 @@ ${directionIcon} Direction: ${activeTrade.direction}
                         chatId,
                         `🎉 <b>TAKE PROFIT 3 ACHIEVED (Trade Completed)</b> 🎉\n\n🪙 <b>Pair:</b> #${symbol}\n📈 <b>Direction:</b> LONG\n✅ <b>Final Target:</b> <code>${formatPrice(activeTrade.tp3)}</code>\n💰 <b>Final Secured Return:</b> ${pnlSegment} (on remaining 20% runner)\n⭐️ <b>Status:</b> Trade successfully reached ultimate target! Enjoy the profits.`,
                       ).catch(console.error);
+
+                      // Webhook Engine Auto-Dispatch for TP3 (Trade completed)
+                      try {
+                        const whConfig = getWebhookConfig();
+                        if (whConfig.enabled && whConfig.autoDispatch && whConfig.webhookUrl) {
+                          dispatchWebhookSignal({
+                            symbol: symbol,
+                            direction: 'CLOSE_LONG',
+                            eventType: 'TP3_HIT',
+                            closePercent: 20,
+                            entryPrice: activeTrade.tp3,
+                            sl: activeTrade.entry,
+                            pnlPercent: pnlSegment,
+                            confidence: activeTrade.confidence,
+                            timeframe: '15m',
+                            session: activeTrade.session,
+                          }).catch(console.error);
+                        }
+                      } catch (whErr) {
+                        console.error('[Webhook Engine TP3 Error]', whErr);
+                      }
                       
                       recordTradeResult("WIN");
                       
@@ -1637,6 +1780,27 @@ ${directionIcon} Direction: ${activeTrade.direction}
                         chatId,
                         `🎯 <b>TAKE PROFIT 1 ACHIEVED (50% Booked)</b> 🎯\n\n🪙 <b>Pair:</b> #${symbol}\n📉 <b>Direction:</b> SHORT\n✅ <b>Target 1:</b> <code>${formatPrice(activeTrade.tp1)}</code>\n💰 <b>Secured Return:</b> ${pnlSegment} (on 50% allocation)\n🛡 <b>Risk Management:</b> Stop Loss moved to Break-Even (<code>${formatPrice(activeTrade.entry)}</code>). Trade is now 100% risk-free!`,
                       ).catch(console.error);
+
+                      // Webhook Engine Auto-Dispatch for TP1 (50% booking & SL to BE)
+                      try {
+                        const whConfig = getWebhookConfig();
+                        if (whConfig.enabled && whConfig.autoDispatch && whConfig.webhookUrl) {
+                          dispatchWebhookSignal({
+                            symbol: symbol,
+                            direction: 'PARTIAL_EXIT',
+                            eventType: 'TP1_HIT',
+                            closePercent: 50,
+                            entryPrice: activeTrade.tp1,
+                            sl: activeTrade.entry,
+                            pnlPercent: pnlSegment,
+                            confidence: activeTrade.confidence,
+                            timeframe: '15m',
+                            session: activeTrade.session,
+                          }).catch(console.error);
+                        }
+                      } catch (whErr) {
+                        console.error('[Webhook Engine TP1 Error]', whErr);
+                      }
                     } 
                     if (activeTrade.hasHitTp1 && !activeTrade.hasHitTp2 && currentLow <= activeTrade.tp2) {
                       activeTrade.hasHitTp2 = true;
@@ -1649,6 +1813,27 @@ ${directionIcon} Direction: ${activeTrade.direction}
                         chatId,
                         `🎯 <b>TAKE PROFIT 2 ACHIEVED (30% Booked)</b> 🎯\n\n🪙 <b>Pair:</b> #${symbol}\n📉 <b>Direction:</b> SHORT\n✅ <b>Target 2:</b> <code>${formatPrice(activeTrade.tp2)}</code>\n💰 <b>Secured Return:</b> ${pnlSegment} (on 30% allocation)\n🏃‍♂️ <b>Next:</b> Remaining 20% position running risk-free to TP3 target!`,
                       ).catch(console.error);
+
+                      // Webhook Engine Auto-Dispatch for TP2 (30% booking)
+                      try {
+                        const whConfig = getWebhookConfig();
+                        if (whConfig.enabled && whConfig.autoDispatch && whConfig.webhookUrl) {
+                          dispatchWebhookSignal({
+                            symbol: symbol,
+                            direction: 'PARTIAL_EXIT',
+                            eventType: 'TP2_HIT',
+                            closePercent: 30,
+                            entryPrice: activeTrade.tp2,
+                            sl: activeTrade.entry,
+                            pnlPercent: pnlSegment,
+                            confidence: activeTrade.confidence,
+                            timeframe: '15m',
+                            session: activeTrade.session,
+                          }).catch(console.error);
+                        }
+                      } catch (whErr) {
+                        console.error('[Webhook Engine TP2 Error]', whErr);
+                      }
                     } 
                     if (activeTrade.hasHitTp2 && !activeTrade.hasHitTp3 && currentLow <= activeTrade.tp3) {
                       activeTrade.hasHitTp3 = true;
@@ -1660,6 +1845,27 @@ ${directionIcon} Direction: ${activeTrade.direction}
                         chatId,
                         `🎉 <b>TAKE PROFIT 3 ACHIEVED (Trade Completed)</b> 🎉\n\n🪙 <b>Pair:</b> #${symbol}\n📉 <b>Direction:</b> SHORT\n✅ <b>Final Target:</b> <code>${formatPrice(activeTrade.tp3)}</code>\n💰 <b>Final Secured Return:</b> ${pnlSegment} (on remaining 20% runner)\n⭐️ <b>Status:</b> Trade successfully reached ultimate target! Enjoy the profits.`,
                       ).catch(console.error);
+
+                      // Webhook Engine Auto-Dispatch for TP3 (Trade completed)
+                      try {
+                        const whConfig = getWebhookConfig();
+                        if (whConfig.enabled && whConfig.autoDispatch && whConfig.webhookUrl) {
+                          dispatchWebhookSignal({
+                            symbol: symbol,
+                            direction: 'CLOSE_SHORT',
+                            eventType: 'TP3_HIT',
+                            closePercent: 20,
+                            entryPrice: activeTrade.tp3,
+                            sl: activeTrade.entry,
+                            pnlPercent: pnlSegment,
+                            confidence: activeTrade.confidence,
+                            timeframe: '15m',
+                            session: activeTrade.session,
+                          }).catch(console.error);
+                        }
+                      } catch (whErr) {
+                        console.error('[Webhook Engine TP3 Error]', whErr);
+                      }
                       
                       recordTradeResult("WIN");
                       
@@ -1993,15 +2199,18 @@ ${directionIcon} Direction: ${sig.analysis.signal}
 
           sendTelegramSignal(botToken, chatId, message, imageUrl).catch(console.error);
 
-          // Webhook Engine Auto-Dispatch
+          // Webhook Engine Auto-Dispatch (Criteria identical to Telegram Notification)
           try {
             const whConfig = getWebhookConfig();
             if (whConfig.enabled && whConfig.autoDispatch && whConfig.webhookUrl) {
-              const reqConf = whConfig.minConfidence || 80;
+              const reqConf = typeof whConfig.minConfidence === 'number' ? whConfig.minConfidence : 50;
               if (sig.analysis.confidence >= reqConf) {
                 dispatchWebhookSignal({
                   symbol: sig.symbol,
                   direction: sig.analysis.signal as any,
+                  eventType: sig.isUpgrade ? 'SIGNAL_UPGRADE' : 'SIGNAL_ENTRY',
+                  isUpgrade: sig.isUpgrade,
+                  oldConfidence: sig.oldConfidence,
                   entryPrice: sig.entryPrice,
                   limitEntry: sig.analysis.limitEntry,
                   sl: sig.sl,
@@ -2013,6 +2222,7 @@ ${directionIcon} Direction: ${sig.analysis.signal}
                   analysis: sig.analysis,
                   timeframe: "15m",
                   session: sessionName,
+                  reason: logicStrRaw,
                 }).then((whRes) => {
                   if (whRes.success) {
                     console.log(`🚀 [Webhook Engine] Successfully auto-dispatched ${sig.analysis.signal} signal for ${sig.symbol} to ${whConfig.webhookUrl}`);
