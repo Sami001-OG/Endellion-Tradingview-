@@ -1,0 +1,2181 @@
+import "dotenv/config";
+import express from "express";
+import { createServer as createViteServer } from "vite";
+import path from "path";
+import crypto from "crypto";
+import fs from "fs";
+import { analyzeChart } from "./src/analysis.ts";
+import {
+  getHTFDirection,
+  validateLTFEntry,
+  get1HControlState,
+} from "./src/multiTimeframe.ts";
+import { detectMSS } from "./src/structure.ts";
+import { formatPrice } from "./src/utils/format.ts";
+import { EMA, MACD, RSI } from "technicalindicators";
+import {
+  loadWebhookData,
+  getWebhookConfig,
+  saveWebhookConfig,
+  dispatchWebhookSignal,
+  buildSignalPayload,
+  getDeliveryLogs,
+  clearDeliveryLogs,
+} from "./src/webhookEngine.ts";
+
+loadWebhookData();
+
+// --- STREAK TRACKER & QUARTER-KELLY RISK SIZING ---
+let consecutiveStreak = 0; // Positive for wins, negative for losses
+const STREAK_FILE_PATH = path.join(process.cwd(), "streak_state.json");
+
+function loadStreakState() {
+  try {
+    if (fs.existsSync(STREAK_FILE_PATH)) {
+      const data = fs.readFileSync(STREAK_FILE_PATH, "utf8");
+      const obj = JSON.parse(data);
+      consecutiveStreak = parseInt(obj.consecutiveStreak) || 0;
+      console.log(`[Streak Tracker] Loaded consecutive streak: ${consecutiveStreak}`);
+    } else {
+      console.log(`[Streak Tracker] No streak state file found, initialized to 0.`);
+    }
+  } catch (e) {
+    console.error("[Streak Tracker] Error loading streak state:", e);
+  }
+}
+
+function saveStreakState() {
+  try {
+    fs.writeFileSync(STREAK_FILE_PATH, JSON.stringify({ consecutiveStreak }), "utf8");
+  } catch (e) {
+    console.error("[Streak Tracker] Error saving streak state:", e);
+  }
+}
+
+function recordTradeResult(result: "WIN" | "LOSS") {
+  const prevStreak = consecutiveStreak;
+  if (result === "WIN") {
+    if (consecutiveStreak < 0) {
+      consecutiveStreak = 1;
+    } else {
+      consecutiveStreak++;
+    }
+  } else {
+    if (consecutiveStreak > 0) {
+      consecutiveStreak = -1;
+    } else {
+      consecutiveStreak--;
+    }
+  }
+  saveStreakState();
+  console.log(`[Streak Tracker] Trade outcome: ${result}. Streak shifted from ${prevStreak} to ${consecutiveStreak}`);
+}
+
+function getSizingModel() {
+  const winRate = 0.584; // Backtested baseline win rate (Rank #1 top-performing parameter set)
+  // Weighted expected R:R based on take profit levels:
+  // TP1 (50% Volume at ~1.0 R:R), TP2 (30% Volume at ~2.0 R:R), TP3 (20% Volume at ~4.0 R:R)
+  // Weighted expected reward: 0.50 * 1.0 + 0.30 * 2.0 + 0.20 * 4.0 = 1.90 R:R
+  const rr = 1.90; 
+  // Kelly Fraction: f* = w - (1 - w) / RR
+  const fStar = winRate - (1 - winRate) / rr; 
+  const quarterKelly = 0.25 * fStar; // Conservative Quarter-Kelly sizing
+  
+  // Streak Modifier (M_streak)
+  let mStreak = 1.0;
+  if (consecutiveStreak >= 0) {
+    mStreak = 1.0 + Math.min(consecutiveStreak * 0.10, 0.50); // Cap boost at +50% (+0.50)
+  } else {
+    mStreak = 1.0 - Math.min(Math.abs(consecutiveStreak) * 0.15, 0.75); // Floor reduction at -75% (0.25)
+  }
+  
+  const recommendedSizingPercent = Math.max(0.1, quarterKelly * mStreak * 100); // recommended % of account size
+  
+  return {
+    consecutiveStreak,
+    mStreak,
+    winRate,
+    rr,
+    quarterKelly,
+    recommendedSizingPercent
+  };
+}
+
+// Load the streak state at boot
+loadStreakState();
+
+function calculatePnL(
+  entry: number,
+  exit: number,
+  direction: "LONG" | "SHORT",
+) {
+  const pnl =
+    direction === "LONG"
+      ? ((exit - entry) / entry) * 100 * 10
+      : ((entry - exit) / entry) * 100 * 10;
+  return pnl >= 0 ? `+${pnl.toFixed(2)}%` : `${pnl.toFixed(2)}%`;
+}
+// --- DAILY PNL TRACKER ---
+interface DailyPnLState {
+  dateStr: string;
+  totalNetReturn: number;
+  wins: number;
+  losses: number;
+  grossProfit: number;
+  grossLoss: number;
+  signalsGenerated: number;
+  totalTradesCompleted: number;
+  bestTrade: number;
+  worstTrade: number;
+  highestConfWin: number;
+  highestConfLoss: number;
+  longWins: number;
+  longLosses: number;
+  shortWins: number;
+  shortLosses: number;
+  sessionWins: Record<string, number>;
+  sessionLosses: Record<string, number>;
+  reported: boolean;
+}
+
+const DAILY_PNL_FILE_PATH = path.join(process.cwd(), "daily_pnl_state.json");
+let dailyPnLState: DailyPnLState = {
+  dateStr: "",
+  totalNetReturn: 0,
+  wins: 0,
+  losses: 0,
+  grossProfit: 0,
+  grossLoss: 0,
+  signalsGenerated: 0,
+  totalTradesCompleted: 0,
+  bestTrade: -9999,
+  worstTrade: 9999,
+  highestConfWin: 0,
+  highestConfLoss: 0,
+  longWins: 0,
+  longLosses: 0,
+  shortWins: 0,
+  shortLosses: 0,
+  sessionWins: { London: 0, "New York": 0, Asian: 0, OUTSIDE: 0 },
+  sessionLosses: { London: 0, "New York": 0, Asian: 0, OUTSIDE: 0 },
+  reported: false
+};
+
+function getBstDateString(offsetMs = 0) {
+  return new Date(Date.now() + 6 * 60 * 60 * 1000 + offsetMs).toISOString().split('T')[0];
+}
+
+function loadDailyPnLState() {
+  try {
+    if (fs.existsSync(DAILY_PNL_FILE_PATH)) {
+      dailyPnLState = JSON.parse(fs.readFileSync(DAILY_PNL_FILE_PATH, "utf8"));
+    }
+    const currentBstDay = getBstDateString();
+    if (!dailyPnLState.dateStr) {
+      dailyPnLState.dateStr = currentBstDay;
+      saveDailyPnLState();
+    }
+  } catch (e) {
+    console.error("[Daily PnL] Error:", e);
+  }
+}
+
+function saveDailyPnLState() {
+  try {
+    fs.writeFileSync(DAILY_PNL_FILE_PATH, JSON.stringify(dailyPnLState), "utf8");
+  } catch (e) {}
+}
+
+loadDailyPnLState();
+
+function calculatePnLNumber(
+  entry: number, exit: number, direction: "LONG" | "SHORT"
+): number {
+  return direction === "LONG"
+      ? ((exit - entry) / entry) * 100 * 10
+      : ((entry - exit) / entry) * 100 * 10;
+}
+
+function recordPnLSegment(pnlPct: number, portion: number, isWinOrLossSegment: "WIN" | "LOSS" | null, activeTrade: any = null) {
+    loadDailyPnLState();
+    const realizedPnl = pnlPct * portion;
+    
+    dailyPnLState.totalNetReturn += realizedPnl;
+    
+    if (realizedPnl >= 0) {
+       dailyPnLState.grossProfit += realizedPnl;
+    } else {
+       dailyPnLState.grossLoss += Math.abs(realizedPnl);
+    }
+    
+    if (isWinOrLossSegment) {
+       dailyPnLState.totalTradesCompleted++;
+       
+       if (activeTrade) {
+          const tradeNetPnl = (activeTrade as any)._accumulatedPnl !== undefined ? ((activeTrade as any)._accumulatedPnl + realizedPnl) : realizedPnl;
+          
+          if (tradeNetPnl > dailyPnLState.bestTrade || dailyPnLState.bestTrade === -9999) dailyPnLState.bestTrade = tradeNetPnl;
+          if (tradeNetPnl < dailyPnLState.worstTrade || dailyPnLState.worstTrade === 9999) dailyPnLState.worstTrade = tradeNetPnl;
+          
+          // Override the segment's outcome with the true net outcome of the entire trade
+          const trueOutcome = tradeNetPnl >= 0 ? "WIN" : "LOSS";
+
+          if (trueOutcome === "WIN") {
+              if (activeTrade.confidence && activeTrade.confidence > dailyPnLState.highestConfWin) dailyPnLState.highestConfWin = activeTrade.confidence;
+              if (activeTrade.direction === "LONG") dailyPnLState.longWins++;
+              if (activeTrade.direction === "SHORT") dailyPnLState.shortWins++;
+              if (activeTrade.session) {
+                 if (!dailyPnLState.sessionWins[activeTrade.session]) dailyPnLState.sessionWins[activeTrade.session] = 0;
+                 dailyPnLState.sessionWins[activeTrade.session]++;
+              }
+          }
+          if (trueOutcome === "LOSS") {
+              if (activeTrade.confidence && activeTrade.confidence > dailyPnLState.highestConfLoss) dailyPnLState.highestConfLoss = activeTrade.confidence;
+              if (activeTrade.direction === "LONG") dailyPnLState.longLosses++;
+              if (activeTrade.direction === "SHORT") dailyPnLState.shortLosses++;
+              if (activeTrade.session) {
+                 if (!dailyPnLState.sessionLosses[activeTrade.session]) dailyPnLState.sessionLosses[activeTrade.session] = 0;
+                 dailyPnLState.sessionLosses[activeTrade.session]++;
+              }
+          }
+          
+          if (trueOutcome === "WIN") dailyPnLState.wins++;
+          if (trueOutcome === "LOSS") dailyPnLState.losses++;
+       } else {
+          // Fallback if no activeTrade object passed
+          if (isWinOrLossSegment === "WIN") dailyPnLState.wins++;
+          if (isWinOrLossSegment === "LOSS") dailyPnLState.losses++;
+       }
+    } else if (activeTrade) {
+       // Just accumulating part of a trade
+       (activeTrade as any)._accumulatedPnl = ((activeTrade as any)._accumulatedPnl || 0) + realizedPnl;
+    }
+    
+    saveDailyPnLState();
+}
+
+function processDailyRolloverAndReport(botToken: string, chatId: string) {
+  try {
+     loadDailyPnLState();
+     const currentBstDay = getBstDateString();
+     
+     if (dailyPnLState.dateStr && dailyPnLState.dateStr !== currentBstDay) {
+        if (!dailyPnLState.reported) {
+           const sign = dailyPnLState.totalNetReturn >= 0 ? "+" : "";
+           
+           const grossLoss = dailyPnLState.grossLoss === 0 ? 1 : dailyPnLState.grossLoss;
+           const profitFactor = dailyPnLState.grossProfit / grossLoss;
+           
+           const winRate = dailyPnLState.totalTradesCompleted > 0 ? (dailyPnLState.wins / dailyPnLState.totalTradesCompleted * 100) : 0;
+           
+           const bestTradeStr = dailyPnLState.bestTrade !== -9999 ? (dailyPnLState.bestTrade >= 0 ? `+${dailyPnLState.bestTrade.toFixed(1)}%` : `${dailyPnLState.bestTrade.toFixed(1)}%`) : "N/A";
+           const worstTradeStr = dailyPnLState.worstTrade !== 9999 ? (dailyPnLState.worstTrade >= 0 ? `+${dailyPnLState.worstTrade.toFixed(1)}%` : `${dailyPnLState.worstTrade.toFixed(1)}%`) : "N/A";
+           
+           let sessionStr = "";
+           const allSessions = new Set([...Object.keys(dailyPnLState.sessionWins), ...Object.keys(dailyPnLState.sessionLosses)]);
+           allSessions.forEach(sess => {
+              if (sess !== "OUTSIDE") {
+                 const w = dailyPnLState.sessionWins[sess] || 0;
+                 const l = dailyPnLState.sessionLosses[sess] || 0;
+                 if (w > 0 || l > 0) {
+                     sessionStr += `${sess}: ${w}W / ${l}L\n`;
+                 }
+              }
+           });
+           if (!sessionStr) sessionStr = "N/A\n";
+           
+           const msg = `📊 Daily Performance Report (${dailyPnLState.dateStr})
+
+💰 Net Return: ${sign}${dailyPnLState.totalNetReturn.toFixed(2)}%
+📈 Profit Factor: ${profitFactor.toFixed(2)}
+
+✅ Wins: ${dailyPnLState.wins}
+❌ Losses: ${dailyPnLState.losses}
+🎯 Win Rate: ${winRate.toFixed(2)}%
+
+📊 Signals Generated: ${dailyPnLState.signalsGenerated}
+🚀 Trades Taken: ${dailyPnLState.totalTradesCompleted}
+
+🏆 Best Trade: ${bestTradeStr}
+💀 Worst Trade: ${worstTradeStr}
+
+🔥 Highest Confidence Win: ${dailyPnLState.highestConfWin.toFixed(0)}%
+⚠️ Highest Confidence Loss: ${dailyPnLState.highestConfLoss.toFixed(0)}%
+
+🟢 Longs: ${dailyPnLState.longWins}W / ${dailyPnLState.longLosses}L
+🔴 Shorts: ${dailyPnLState.shortWins}W / ${dailyPnLState.shortLosses}L
+
+⏱ Session:
+${sessionStr}
+Time: 00:00 BST`;
+           
+           if (botToken && chatId) {
+              sendTelegramSignal(botToken, chatId, msg).catch(console.error);
+           }
+        }
+        
+        dailyPnLState = {
+           dateStr: currentBstDay,
+           totalNetReturn: 0,
+           wins: 0,
+           losses: 0,
+           grossProfit: 0,
+           grossLoss: 0,
+           signalsGenerated: 0,
+           totalTradesCompleted: 0,
+           bestTrade: -9999,
+           worstTrade: 9999,
+           highestConfWin: 0,
+           highestConfLoss: 0,
+           longWins: 0,
+           longLosses: 0,
+           shortWins: 0,
+           shortLosses: 0,
+           sessionWins: { London: 0, "New York": 0, Asian: 0, OUTSIDE: 0 },
+           sessionLosses: { London: 0, "New York": 0, Asian: 0, OUTSIDE: 0 },
+           reported: false
+        };
+        saveDailyPnLState();
+     }
+  } catch (e) {
+     console.error("[Daily PnL] Rollover error:", e);
+  }
+}
+
+import { Candle, Trade } from "./src/types";
+
+const DEFAULT_RELIABILITY = {
+  ema: 1.5,
+  macd: 1.0,
+  rsi: 1.5,
+  vol: 1.2,
+  obv: 1.2,
+  exception: 2.0,
+};
+
+function getIndicatorKey() {
+  const key = process.env.BINANCE_API_KEY_2 || process.env.BINANCE_API_KEY;
+  return { key };
+}
+
+function getWsKey() {
+  const key = process.env.BINANCE_API_KEY_3 || process.env.BINANCE_API_KEY;
+  return { key };
+}
+
+async function sendTelegramSignal(
+  botToken: string,
+  chatId: string,
+  message: string,
+  imageUrl?: string,
+  retries = 15
+) {
+  if (!botToken || !chatId) return false;
+
+  const cleanToken = botToken.replace(/^["']|["']$/g, "").trim();
+  let cleanChatId = chatId.replace(/^["']|["']$/g, "").trim();
+
+  if (cleanChatId.includes("t.me/")) {
+    cleanChatId = cleanChatId.split("t.me/")[1].split("/")[0].split("?")[0];
+  }
+
+  if (!/^-?\d+$/.test(cleanChatId) && !cleanChatId.startsWith("@")) {
+    cleanChatId = "@" + cleanChatId;
+  }
+
+  const finalToken = cleanToken.toLowerCase().startsWith("bot")
+    ? cleanToken.substring(3)
+    : cleanToken;
+
+  let url = `https://api.telegram.org/bot${finalToken}/sendMessage`;
+  let body: any = {
+    chat_id: cleanChatId,
+    text: message,
+    parse_mode: "HTML",
+  };
+
+  if (imageUrl) {
+    url = `https://api.telegram.org/bot${finalToken}/sendPhoto`;
+    body = {
+      chat_id: cleanChatId,
+      photo: imageUrl,
+      caption: message,
+      parse_mode: "HTML",
+    };
+  }
+
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  let response;
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      response = await fetchWithTimeout(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+        timeout: 10000,
+      });
+
+      if (!response.ok && imageUrl) {
+        throw new Error(`Telegram API responded with ${response.status} when sending photo`);
+      }
+
+      if (response.ok) {
+        console.log(`[Telegram] Message sent successfully to ${cleanChatId}`);
+        return true;
+      }
+
+      const errorText = await response.text();
+      console.warn(
+        `[Telegram API ERROR] Attempt ${attempt}: ${response.status} - ${errorText}`,
+      );
+
+      if (response.status === 400 && errorText.includes("parse entities")) {
+        // Unrecoverable formatting error. Try once completely without HTML parsing
+        if (body.parse_mode) {
+          body.parse_mode = undefined;
+          console.log(
+            `[Telegram] Falling back to raw text (no HTML parse_mode) for Telegram...`,
+          );
+          const fallbackResponse = await fetchWithTimeout(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+            timeout: 10000,
+          });
+          if (fallbackResponse.ok) {
+            console.log(`[Telegram] Raw text message sent successfully.`);
+            return true;
+          }
+          console.warn(
+            `[Telegram] Raw text fallback also failed: ${await fallbackResponse.text()}`,
+          );
+        }
+        return false;
+      }
+
+      if (response.status === 404) {
+         console.warn(`[Telegram ERROR] Bot token is invalid or chat ID not found. (404 Not Found)`);
+         // No point in retrying
+         return false;
+      }
+
+      if (response.status === 401) {
+         console.warn(`[Telegram ERROR] Unauthorized. Bot token is incorrect. (401)`);
+         return false;
+      }
+
+      if (response.status === 429) {
+        // Rate limited
+        const data = JSON.parse(errorText);
+        const retryAfter = data.parameters?.retry_after || 5;
+        console.warn(`[Telegram] Rate limited. Waiting ${retryAfter} seconds...`);
+        await sleep(retryAfter * 1000);
+      } else {
+        await sleep(attempt * 1000);
+      }
+    } catch (error: any) {
+      console.warn(`[Telegram] Fetch error on attempt ${attempt}:`, error.message || error);
+      
+      // Fallback to text message if photo fails (e.g. quickchart.io is down or times out)
+      if (imageUrl) {
+        console.log(`[Telegram] Photo failed on attempt ${attempt}. Fallback to text...`);
+        imageUrl = undefined; // Do not try photo again
+        url = `https://api.telegram.org/bot${finalToken}/sendMessage`;
+        body = {
+          chat_id: cleanChatId,
+          text: message,
+          parse_mode: "HTML",
+        };
+      }
+      
+      await sleep(attempt * 1000);
+    }
+  }
+
+  return false;
+}
+
+async function fetchWithTimeout(url: string, options: any = {}, intent: 'INDICATOR' | 'WEBSOCKET' | 'TRADING' = 'INDICATOR') {
+  const timeout = options.timeout || 10000;
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeout);
+  try {
+    // If it's a Binance request, inject a specifically targeted API key to bypass potential IP rate limits
+    if (url.includes('binance.com')) {
+      let creds;
+      if (intent === 'WEBSOCKET') creds = getWsKey();
+      else creds = getIndicatorKey();
+
+      if (creds && creds.key) {
+        options.headers = {
+          ...options.headers,
+          "X-MBX-APIKEY": creds.key
+        };
+      }
+    }
+
+    let response = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+    
+    const contentType = response.headers.get("content-type");
+    const isHtml = contentType && contentType.includes("text/html");
+
+    // Handle Binance Geoblocks on US environments (Render, etc.), IP Bans (429), or HTML responses from Cloudflare
+    if ((!response.ok && (response.status === 451 || response.status === 403 || response.status === 429 || response.status === 418)) || (response.ok && isHtml)) {
+      if (response.ok && isHtml) {
+        throw new Error(`Expected JSON but received HTML from ${url}`);
+      } else {
+        throw new Error(`API Request blocked or limited. Status: ${response.status}. URL: ${url}`);
+      }
+    }
+
+    clearTimeout(id);
+    return response;
+  } catch (error) {
+    clearTimeout(id);
+    throw error;
+  }
+}
+
+const MEME_COINS = new Set([
+  "DOGEUSDT",
+  "SHIBUSDT",
+  "1000SHIBUSDT",
+  "PEPEUSDT",
+  "1000PEPEUSDT",
+  "FLOKIUSDT",
+  "1000FLOKIUSDT",
+  "BONKUSDT",
+  "1000BONKUSDT",
+  "WIFUSDT",
+  "BOMEUSDT",
+  "MEMEUSDT",
+  "MYROUSDT",
+  "POPCATUSDT",
+  "MEWUSDT",
+  "BRETTUSDT",
+  "NEIROUSDT",
+  "PNUTUSDT",
+  "TURBOUSDT",
+  "MOGUSDT",
+  "CATIUSDT",
+  "DOGSUSDT",
+  "BABYDOGEUSDT",
+  "1MBABYDOGEUSDT",
+  "MOODENGUSDT",
+  "GOATUSDT",
+  "ACTUSDT",
+  "PEOPLEUSDT",
+  "SLERFUSDT",
+  "WENUSDT",
+  "COQUSDT",
+  "PORKUSDT",
+  "MUMUUSDT",
+  "DEGENUSDT",
+  "TOSHIUSDT",
+  "FOXYUSDT",
+  "PONKEUSDT",
+  "SUNDOGUSDT",
+  "HMSTRUSDT",
+  "CATUSDT",
+  "SIMONCATUSDT",
+  "HIPPOUSDT",
+  "PENGUUSDT",
+  "SATSUSDT",
+  "1000SATSUSDT",
+  "RATSUSDT",
+  "NOTUSDT",
+]);
+
+let cachedTopSymbols: string[] = [];
+let lastTopSymbolsUpdate = 0;
+
+async function fetchTopSymbols() {
+  if (Date.now() - lastTopSymbolsUpdate < 24 * 60 * 60 * 1000 && cachedTopSymbols.length > 0) {
+    return cachedTopSymbols;
+  }
+  try {
+    const res = await fetchWithTimeout(
+      `https://fapi.binance.com/fapi/v1/ticker/24hr?_t=${Date.now()}`,
+      { timeout: 10000 },
+      'INDICATOR'
+    );
+    if (!res.headers.get("content-type")?.includes("application/json")) {
+      throw new Error("Binance HTML error");
+    }
+    const data = await res.json();
+    cachedTopSymbols = data
+      .filter(
+        (t: any) =>
+          t.symbol.endsWith("USDT") &&
+          parseFloat(t.volume) > 0 &&
+          !t.symbol.includes("UPUSDT") &&
+          !t.symbol.includes("DOWNUSDT") &&
+          !t.symbol.includes("BULLUSDT") &&
+          !t.symbol.includes("BEARUSDT") &&
+          !MEME_COINS.has(t.symbol),
+      )
+      .sort(
+        (a: any, b: any) =>
+          parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume),
+      )
+      .slice(0, 50) // background scanner will parse the top 50 volume pairs
+      .map((t: any) => t.symbol);
+    lastTopSymbolsUpdate = Date.now();
+    return cachedTopSymbols;
+  } catch (e) {
+    if (cachedTopSymbols.length > 0) return cachedTopSymbols;
+    return [
+      "BTCUSDT",
+      "ETHUSDT",
+      "SOLUSDT",
+      "BNBUSDT",
+      "XRPUSDT",
+      "ADAUSDT",
+      "AVAXUSDT",
+      "LINKUSDT",
+      "DOTUSDT",
+    ];
+  }
+}
+
+import WebSocket from "ws";
+
+const klineCache: Record<string, Record<string, any[]>> = {};
+const subscribedStreams = new Set<string>();
+let binanceWs: WebSocket | null = null;
+let reconnectTimer: NodeJS.Timeout | null = null;
+let rateLimitNotified = false;
+
+function initBinanceWs() {
+  if (binanceWs) return;
+  const wsOptions: WebSocket.ClientOptions = {};
+  const wsCreds = getWsKey();
+  if (wsCreds && wsCreds.key) {
+    wsOptions.headers = {
+      "X-MBX-APIKEY": wsCreds.key
+    };
+  }
+  binanceWs = new WebSocket('wss://fstream.binance.com/stream', wsOptions);
+
+  binanceWs.on('open', () => {
+    console.log('[Binance WS] Connected for background scanner');
+    if (subscribedStreams.size > 0) {
+      wsSubscribeQueue.push(...Array.from(subscribedStreams));
+      processWsQueue();
+    }
+  });
+
+  binanceWs.on('message', (data: WebSocket.Data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      if (msg.data && msg.data.e === 'kline') {
+        const s = msg.data.s;
+        const i = msg.data.k.i;
+        const k = msg.data.k;
+        
+        if (!klineCache[s]) klineCache[s] = {};
+        if (!klineCache[s][i]) klineCache[s][i] = [];
+        
+        const arr = klineCache[s][i];
+        const last = arr.length > 0 ? arr[arr.length - 1] : null;
+        const openTime = Math.floor(k.t / 1000);
+        
+        const candleData = {
+          time: openTime,
+          open: parseFloat(k.o),
+          high: parseFloat(k.h),
+          low: parseFloat(k.l),
+          close: parseFloat(k.c),
+          volume: parseFloat(k.v),
+          isFinal: k.x
+        };
+
+        let broadcastTopTrades = false;
+        for (let t = 0; t < globalFrontendTrades.length; t++) {
+           if (globalFrontendTrades[t].symbol === s) {
+              if (globalFrontendTrades[t].lastPrice !== candleData.close) {
+                 globalFrontendTrades[t].lastPrice = candleData.close;
+                 broadcastTopTrades = true;
+              }
+           }
+        }
+
+        if (broadcastTopTrades) {
+           const now = Date.now();
+           if (!klineCache['LAST_TOP_TRADES_BROADCAST'] || now - (klineCache['LAST_TOP_TRADES_BROADCAST'] as any) > 200) {
+              (klineCache as any)['LAST_TOP_TRADES_BROADCAST'] = now;
+              if ((global as any).broadcastToClients) {
+                 (global as any).broadcastToClients({ type: 'top-trades', payload: globalFrontendTrades, signals: globalFrontendTrades });
+              }
+           }
+        }
+
+        if (last && last.time === openTime) {
+          arr[arr.length - 1] = candleData;
+        } else if (last && openTime > last.time) {
+          arr.push(candleData);
+          if (arr.length > 1500) arr.shift();
+        } else if (!last) {
+          arr.push(candleData);
+        }
+
+        const subsMap = (global as any).clientSubscriptions;
+        if (subsMap) {
+           let emittedKey = false;
+           // We can throttle indicators if we want, but letting data stream 
+           // continuously is fine as market-data-update only sends 1 object.
+           const now = Date.now();
+           const cKey = `${s}_${i}_last_emit` as any;
+           // throttle indicators calculation to every 1s to save CPU
+           const shouldCalcIndicators = !(klineCache as any)[cKey] || now - (klineCache as any)[cKey] > 1000;
+           let updatedAnalysis: any = null;
+
+           subsMap.forEach((subs: any, wsClient: any) => {
+              if (wsClient.readyState === 1 && subs.some((sub: any) => sub.symbol === s && sub.interval === i)) {
+                 try {
+                    const payload: any = { type: 'market-data-update', symbol: s, interval: i, data: candleData };
+                    if (shouldCalcIndicators) {
+                        if (!updatedAnalysis) updatedAnalysis = analyzeChart(arr, undefined, [], s, i);
+                        payload.indicators = updatedAnalysis;
+                    }
+                    wsClient.send(JSON.stringify(payload));
+                 } catch(e) {}
+                 emittedKey = true;
+              }
+           });
+           
+           if (emittedKey && shouldCalcIndicators) {
+               (klineCache as any)[cKey] = now;
+           }
+        }
+      }
+    } catch (err) {
+      // safely ignore decode errors
+    }
+  });
+
+  binanceWs.on('close', () => {
+    console.log('[Binance WS] Disconnected, reconnecting...');
+    binanceWs = null;
+    if (!reconnectTimer) {
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        initBinanceWs();
+      }, 5000);
+    }
+  });
+
+  binanceWs.on('error', (err: any) => {
+    console.error('[Binance WS] Error:', err.message);
+  });
+}
+
+function subscribeToWs(symbol: string, tf: string) {
+  const streamName = `${symbol.toLowerCase()}@kline_${tf}`;
+  if (!subscribedStreams.has(streamName)) {
+    subscribedStreams.add(streamName);
+    wsSubscribeQueue.push(streamName);
+    processWsQueue();
+  }
+}
+
+const wsSubscribeQueue: string[] = [];
+let isProcessingWsQueue = false;
+
+function processWsQueue() {
+  if (isProcessingWsQueue || wsSubscribeQueue.length === 0 || !binanceWs || binanceWs.readyState !== WebSocket.OPEN) return;
+  isProcessingWsQueue = true;
+
+  const streamsToSubscribe = wsSubscribeQueue.splice(0, 50); // Max 50 per request
+  
+  binanceWs.send(JSON.stringify({
+    method: 'SUBSCRIBE',
+    params: streamsToSubscribe,
+    id: Date.now()
+  }));
+
+  setTimeout(() => {
+    isProcessingWsQueue = false;
+    if (wsSubscribeQueue.length > 0) {
+      processWsQueue();
+    }
+  }, 250); // 4 messages per second (max is 5)
+}
+
+
+const inflightKlines = new Map<string, Promise<any>>();
+let isRateLimitedUntil = 0;
+
+function getTfSeconds(tf: string) {
+  const value = parseInt(tf);
+  if (isNaN(value)) return 60;
+  const unit = tf.slice(-1);
+  switch (unit) {
+    case 'm': return value * 60;
+    case 'h': return value * 3600;
+    case 'd': return value * 86400;
+    default: return 60;
+  }
+}
+
+async function fetchKlines(symbol: string, tf: string, limit: number = 200) {
+  if (!binanceWs) initBinanceWs();
+
+  if (!klineCache[symbol]) klineCache[symbol] = {};
+  
+  if (klineCache[symbol][tf] && klineCache[symbol][tf].length >= 50) {
+    const arr = klineCache[symbol][tf];
+    const last = arr[arr.length - 1];
+    const tfSecs = getTfSeconds(tf);
+    // A new candle should start at (last.time + tfSecs).
+    // If we are more than 5 minutes past when the next candle should have opened, it is stale.
+    const isStale = (Date.now() / 1000) - last.time > (tfSecs + 300);
+    if (isStale) {
+      console.log(`[REST API] Cache for ${symbol} ${tf} is stale by over 5 mins, clearing...`);
+      delete klineCache[symbol][tf];
+    }
+  } else if (klineCache[symbol][tf]) {
+    // If the cache length is truncated (e.g. from partial WS tick load or failed initial warmups), clear it to require full refetch
+    console.log(`[REST API] Cache for ${symbol} ${tf} is empty or truncated (${klineCache[symbol][tf].length} candles), clearing to require fresh REST warmup...`);
+    delete klineCache[symbol][tf];
+  }
+
+  if (!klineCache[symbol][tf]) {
+    const cacheKey = `${symbol}_${tf}`;
+    if (inflightKlines.has(cacheKey)) {
+      return inflightKlines.get(cacheKey);
+    }
+    
+    // Check if we are globally rate-limited
+    if (Date.now() < isRateLimitedUntil) {
+      return [];
+    }
+
+    const promise = (async () => {
+      try {
+        console.log(`[REST API] Fetching warm-up data for ${symbol} ${tf}`);
+        const res = await fetchWithTimeout(
+          `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${tf}&limit=${limit}&_t=${Date.now()}`,
+          { timeout: 10000 },
+          'INDICATOR'
+        );
+        if (!res.headers.get("content-type")?.includes("application/json")) {
+           throw new Error("Binance HTML error");
+        }
+        const data = await res.json();
+
+        if (!Array.isArray(data)) {
+          console.warn(
+            `[Binance API Warning] Expected array for ${symbol} ${tf}, got:`,
+            data,
+          );
+          if (
+            data &&
+            data.code === -1003 
+          ) {
+            isRateLimitedUntil = Date.now() + 60000; // Backoff for 1 minute
+            if ((process.env.VITE_TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN) &&
+                (process.env.VITE_TELEGRAM_CHAT_ID || process.env.TELEGRAM_CHAT_ID) &&
+                !rateLimitNotified) {
+              rateLimitNotified = true;
+              sendTelegramSignal(
+                (process.env.VITE_TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN) as string,
+                (process.env.VITE_TELEGRAM_CHAT_ID || process.env.TELEGRAM_CHAT_ID) as string,
+                "⚠️ <b>Binance API Rate Limit Hit!</b>\nScanner is temporarily missing data.",
+              ).catch(console.error);
+              setTimeout(() => {
+                rateLimitNotified = false;
+              }, 3600000); // Reset after 1 hour
+            }
+          }
+          return [];
+        }
+
+        klineCache[symbol][tf] = data.map((d: any) => ({
+          time: Math.floor(d[0] / 1000),
+          open: parseFloat(d[1]),
+          high: parseFloat(d[2]),
+          low: parseFloat(d[3]),
+          close: parseFloat(d[4]),
+          volume: parseFloat(d[5]),
+          isFinal: true,
+        }));
+        
+        subscribeToWs(symbol, tf);
+        return klineCache[symbol][tf].slice(-1500);
+      } catch (e) {
+        console.error(`Error fetching REST klines for ${symbol} ${tf}`, e);
+        return [];
+      } finally {
+        inflightKlines.delete(cacheKey);
+      }
+    })();
+    
+    inflightKlines.set(cacheKey, promise);
+    return promise;
+  }
+  
+  return klineCache[symbol][tf].slice(-1500);
+}
+
+let globalFrontendTrades: any[] = [];
+let lastScanMetrics: any = { status: "not_started" };
+
+async function startServer() {
+  const app = express();
+  const PORT = Number(process.env.PORT || 3000);
+
+  app.use(express.json());
+
+  // API routes FIRST
+  app.use("/api/health", (req, res) => {
+    res.json({ status: "ok" });
+  });
+
+  // Self-ping to keep server alive (prevent sleeping on Render free tier)
+  setInterval(() => {
+    try {
+      if (process.env.RENDER_EXTERNAL_URL) {
+        // Bounce the ping through a public proxy so Render sees it as external inbound traffic!
+        const targetUrl = `${process.env.RENDER_EXTERNAL_URL}/api/health`;
+        const proxyBounceUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(targetUrl)}`;
+        fetch(proxyBounceUrl).catch(() => {});
+      } else {
+        const pingUrl = `http://127.0.0.1:${PORT}/api/health`;
+        fetch(pingUrl).catch(() => {});
+      }
+    } catch(e) {}
+  }, 45000);
+
+  app.get("/api/top-trades", (req, res) => {
+    res.json({ signals: globalFrontendTrades });
+  });
+
+  app.get("/api/scanner-status", (req, res) => {
+    res.json({
+      lastScanMetrics,
+      sizingModel: getSizingModel()
+    });
+  });
+
+  app.post("/api/telegram/send", async (req, res) => {
+    try {
+      let { botToken, chatId, message, imageUrl } = req.body;
+
+      if (!botToken || !chatId) {
+        botToken = process.env.VITE_TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN;
+        chatId = process.env.VITE_TELEGRAM_CHAT_ID || process.env.TELEGRAM_CHAT_ID;
+      }
+
+      if (!botToken || !chatId) {
+        return res.status(400).json({ error: "Missing botToken or chatId" });
+      }
+
+      const success = await sendTelegramSignal(botToken, chatId, message, imageUrl);
+
+      if (!success) {
+        return res.status(500).json({ error: "Failed to send message" });
+      }
+
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Error sending Telegram message via proxy:", error);
+      res.status(500).json({ error: "Failed to send message" });
+    }
+  });
+
+  // --- WEBHOOK ENGINE API ROUTES ---
+  app.get("/api/webhook/config", (req, res) => {
+    try {
+      const config = getWebhookConfig();
+      res.json(config);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post("/api/webhook/config", (req, res) => {
+    try {
+      const updated = saveWebhookConfig(req.body);
+      res.json(updated);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post("/api/webhook/preview", (req, res) => {
+    try {
+      const { signal, config } = req.body;
+      const preview = buildSignalPayload(signal, config || getWebhookConfig());
+      res.json(preview);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+    }
+  });
+
+  app.post("/api/webhook/send", async (req, res) => {
+    try {
+      const { signal, config } = req.body;
+      if (!signal || !signal.symbol || !signal.direction) {
+        return res.status(400).json({ error: "Missing required signal data (symbol, direction, entryPrice, sl)" });
+      }
+
+      const result = await dispatchWebhookSignal(signal, config);
+      if (result.success) {
+        res.json(result);
+      } else {
+        res.status(result.statusCode || 400).json(result);
+      }
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post("/api/webhook/test", async (req, res) => {
+    try {
+      const { config, customPayload } = req.body;
+      const testSignal = customPayload || {
+        symbol: "BTCUSDT",
+        direction: "LONG" as const,
+        entryPrice: 96450.0,
+        limitEntry: 96100.0,
+        sl: 94800.0,
+        tp1: 97500.0,
+        tp2: 98900.0,
+        tp3: 101200.0,
+        confidence: 94.5,
+        timeframe: "15m",
+        session: "London Killzone",
+      };
+
+      const result = await dispatchWebhookSignal(testSignal, config);
+      res.json(result);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.get("/api/webhook/history", (req, res) => {
+    try {
+      const logs = getDeliveryLogs();
+      res.json({ deliveries: logs });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.delete("/api/webhook/history", (req, res) => {
+    try {
+      clearDeliveryLogs();
+      res.json({ success: true });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post("/api/webhook/retry", async (req, res) => {
+    try {
+      const { deliveryId } = req.body;
+      const logs = getDeliveryLogs();
+      const target = logs.find((l) => l.id === deliveryId);
+
+      if (!target) {
+        return res.status(404).json({ error: "Delivery not found" });
+      }
+
+      const signal: any = {
+        symbol: target.symbol,
+        direction: target.action as any,
+        entryPrice: target.requestPayload.entry_price || target.requestPayload.price || (target.requestPayload.entry && target.requestPayload.entry.cmp) || 0,
+        limitEntry: target.requestPayload.limit_entry || (target.requestPayload.entry && target.requestPayload.entry.limitEntry),
+        sl: target.requestPayload.stop_loss || (target.requestPayload.stopLoss && target.requestPayload.stopLoss.price) || 0,
+        tp1: target.requestPayload.take_profit?.[0] || (target.requestPayload.takeProfits && target.requestPayload.takeProfits.tp1?.price),
+        tp2: target.requestPayload.take_profit?.[1] || (target.requestPayload.takeProfits && target.requestPayload.takeProfits.tp2?.price),
+        tp3: target.requestPayload.take_profit?.[2] || (target.requestPayload.takeProfits && target.requestPayload.takeProfits.tp3?.price),
+      };
+
+      const result = await dispatchWebhookSignal(signal);
+      res.json(result);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post("/api/trade/register-active", express.json(), async (req, res) => {
+    try {
+      const trade = req.body;
+      if (trade && trade.symbol) {
+        const entryPrice = parseFloat(trade.entry);
+        const slPrice = parseFloat(trade.sl);
+        const tpPrice = parseFloat(trade.tp);
+        
+        // Compute progressive TP1, TP2, TP3 if not provided
+        const tp1 = parseFloat(trade.tp1) || (trade.type === "LONG" ? entryPrice + (entryPrice - slPrice) : entryPrice - (slPrice - entryPrice));
+        const tp2 = parseFloat(trade.tp2) || (trade.type === "LONG" ? entryPrice + (entryPrice - slPrice) * 2 : entryPrice - (slPrice - entryPrice) * 2);
+        const tp3 = parseFloat(trade.tp3) || tpPrice;
+
+        const alreadyActive = !!activeTrades[trade.symbol];
+        const recentlySignaled = Date.now() - (signalCooldowns[trade.symbol]?.timestamp || 0) < 15 * 60 * 1000;
+
+        if (!alreadyActive) {
+          activeTrades[trade.symbol] = {
+             symbol: trade.symbol,
+             direction: trade.type || trade.direction,
+             entry: entryPrice,
+             initialEntry: entryPrice,
+             tp: tpPrice,
+             tp1,
+             tp2,
+             tp3,
+             sl: slPrice,
+             currentSl: slPrice,
+             achieved: 1, // Set to 1 (Filled / Active instantly for manual registrations)
+             isLimitEntry: false,
+             hasHitTp1: false,
+             hasHitTp2: false,
+             hasHitTp3: false,
+             registeredAt: Date.now()
+          };
+          signalCooldowns[trade.symbol] = {
+             timestamp: Date.now(),
+             direction: trade.type || trade.direction,
+             confidence: 0
+          };
+          saveScannerState();
+          console.log(`[Backend] Registered frontend trade for monitoring: ${trade.symbol}`);
+        } else {
+          console.log(`[Backend] Trade for ${trade.symbol} is already active/monitored. Skipping duplicate registration state override.`);
+        }
+
+        const botToken = process.env.VITE_TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN;
+        const chatId = process.env.VITE_TELEGRAM_CHAT_ID || process.env.TELEGRAM_CHAT_ID;
+        if (botToken && chatId && !alreadyActive && !recentlySignaled) {
+          const directionIcon = trade.type === "LONG" ? "📈" : "📉";
+          const confValue = (trade.confidence || (trade.analysis && trade.analysis.confidence) || 100).toFixed(1);
+          const msg = `🪙 Pair: #${trade.symbol}
+${directionIcon} Direction: ${trade.type}
+  Confidence: ${confValue}%
+🎯 Entry Price: ${formatPrice(entryPrice)}
+🎯 TP1 (50% Booking): ${formatPrice(tp1)}
+🎯 TP2 (30% Booking): ${formatPrice(tp2)}
+🎯 TP3 (20% Runner): ${formatPrice(tp3)}
+❌ Stop Loss: ${formatPrice(slPrice)}
+🛡 Trail Mode: Move SL to Break-Even at TP1`;
+          sendTelegramSignal(botToken as string, chatId as string, msg).catch(console.error);
+        }
+
+        res.json({ success: true });
+      } else {
+        res.status(400).json({ error: "Invalid trade data" });
+      }
+    } catch (e) {
+      res.status(500).json({ error: "Server error" });
+    }
+  });
+
+
+
+  // Proxy endpoints for frontend to bypass CORS/Adblockers
+  app.get("/api/klines", async (req, res) => {
+    try {
+      const symbol = req.query.symbol as string;
+      const interval = req.query.interval as string;
+      const limit = parseInt(req.query.limit as string) || 250;
+      
+      if (!symbol || !interval) return res.status(400).json({ error: "Missing symbol or interval" });
+
+      const data = await fetchKlines(symbol, interval, limit);
+      // fetchKlines returns array of our Candle objects, but the frontend expects Binance format arrays
+      // Let's reconstruct or just adapt the frontend to accept our format.
+      // Wait, let's keep the backend returning the format frontend expects (Binance raw format) OR
+      // frontend expects `data.map(d => ...)`, we can just send it as is, but we must be careful.
+      // Actually, frontend uses fetchWithRetry('.../v1/klines?symbol=...') so it expects Binance format:
+      // [[time, open, high, low, close, volume, closeTime, ...]]
+      
+      const binanceFormat = data.map((c: any) => [
+        c.time * 1000,
+        c.open.toString(),
+        c.high.toString(),
+        c.low.toString(),
+        c.close.toString(),
+        c.volume.toString()
+      ]);
+      
+      res.json(binanceFormat);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/proxy/fapi/*", async (req, res) => {
+    try {
+      const endpoint = req.params[0];
+      const query = new URLSearchParams(req.query as any).toString();
+      const targetUrl = `https://fapi.binance.com/fapi/${endpoint}${query ? "?" + query : ""}`;
+
+      const response = await fetchWithTimeout(targetUrl, { timeout: 10000 }, 'INDICATOR');
+      if (!response.ok) {
+        return res
+          .status(response.status)
+          .json({ error: `Binance API error: ${response.statusText}` });
+      }
+      if (!response.headers.get("content-type")?.includes("application/json")) {
+        throw new Error("Binance HTML error");
+      }
+      const data = await response.json();
+      res.json(data);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.get("/api/proxy/api/*", async (req, res) => {
+    try {
+      const endpoint = req.params[0];
+      const query = new URLSearchParams(req.query as any).toString();
+      const targetUrl = `https://api.binance.com/api/${endpoint}${query ? "?" + query : ""}`;
+
+      const response = await fetchWithTimeout(targetUrl, { timeout: 10000 }, 'INDICATOR');
+      if (!response.ok) {
+        return res
+          .status(response.status)
+          .json({ error: `Binance API error: ${response.statusText}` });
+      }
+      if (!response.headers.get("content-type")?.includes("application/json")) {
+        throw new Error("Binance HTML error");
+      }
+      const data = await response.json();
+      res.json(data);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // Background loop
+  const sentSessionNotifications = new Set<string>();
+
+  interface ActiveTrade {
+    symbol: string;
+    direction: "LONG" | "SHORT";
+    entry: number;
+    initialEntry?: number;
+    pullbackTarget?: number;
+    hasHitPullback?: boolean;
+    tp: number;
+    tp1: number;
+    tp2: number;
+    tp3: number;
+    sl: number;
+    currentSl: number;
+    achieved: number;
+    isLimitEntry: boolean;
+    hasHitTp1: boolean;
+    hasHitTp2: boolean;
+    hasHitTp3: boolean;
+    registeredAt: number;
+    slUpdatedTime?: number;
+    confidence?: number;
+    session?: string;
+  }
+  interface SignalCooldown {
+    timestamp: number;
+    direction: "LONG" | "SHORT";
+    confidence: number;
+  }
+  let activeTrades: Record<string, ActiveTrade> = {};
+  let signalCooldowns: Record<string, SignalCooldown> = {};
+
+  const STATE_FILE_PATH = path.join(process.cwd(), "scanner_state.json");
+  
+  function loadScannerState() {
+    try {
+      if (fs.existsSync(STATE_FILE_PATH)) {
+        const data = fs.readFileSync(STATE_FILE_PATH, "utf8");
+        const obj = JSON.parse(data);
+        if (obj.activeTrades) {
+           activeTrades = obj.activeTrades;
+        }
+        if (obj.signalCooldowns) {
+           signalCooldowns = obj.signalCooldowns;
+        }
+        console.log(`[State] Loaded ${Object.keys(activeTrades).length} active trades and ${Object.keys(signalCooldowns).length} cooldowns from disk.`);
+      }
+    } catch (e) {
+      console.error("[State] Error loading state:", e);
+    }
+  }
+
+  function saveScannerState() {
+    try {
+      fs.writeFileSync(STATE_FILE_PATH, JSON.stringify({ activeTrades, signalCooldowns }, null, 2), "utf8");
+    } catch (e) {
+      console.error("[State] Error saving state:", e);
+    }
+  }
+
+  loadScannerState();
+
+  console.log("Initializing 24/7 Telegram Alert Scanner...");
+  let hasLoggedMissingTokens = false;
+  let hasSentStartupNotification = false;
+  let globalScanIndex = 0;
+
+  const runBackgroundLoop = async () => {
+    const botToken = process.env.VITE_TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN;
+    const chatId = process.env.VITE_TELEGRAM_CHAT_ID || process.env.TELEGRAM_CHAT_ID;
+    const telegramEnabled = !!(botToken && chatId);
+
+    if (!telegramEnabled && !hasLoggedMissingTokens) {
+      console.log(
+        "Telegram tokens missing. Scanner will run locally but skip Telegram alerts.",
+      );
+      hasLoggedMissingTokens = true;
+    }
+    
+    if (telegramEnabled) {
+      hasLoggedMissingTokens = false;
+    }
+
+    try {
+      if (telegramEnabled) {
+         processDailyRolloverAndReport(botToken, chatId);
+      }
+      
+      // --- Session Notifications ---
+      const now = new Date();
+      const utcHour = now.getUTCHours();
+      const utcMinute = now.getUTCMinutes();
+      const dateStr = now.toISOString().split("T")[0];
+
+      const sessions = [
+        { name: "Asian", start: 0, end: 9 },
+        { name: "London", start: 8, end: 17 },
+        { name: "New York", start: 13, end: 22 },
+      ];
+
+      for (const session of sessions) {
+        // Check start window (5 mins before to 5 mins after)
+        let isStartWindow = false;
+        if (session.start === 0) {
+          isStartWindow =
+            (utcHour === 23 && utcMinute >= 55) ||
+            (utcHour === 0 && utcMinute <= 5);
+        } else {
+          isStartWindow =
+            (utcHour === session.start - 1 && utcMinute >= 55) ||
+            (utcHour === session.start && utcMinute <= 5);
+        }
+
+        if (isStartWindow) {
+          const sessionDateStr =
+            utcHour === 23
+              ? new Date(now.getTime() + 86400000).toISOString().split("T")[0]
+              : dateStr;
+          const key = `${session.name}_START_${sessionDateStr}`;
+          if (!sentSessionNotifications.has(key)) {
+            const timeString = `${utcHour.toString().padStart(2, "0")}:${utcMinute.toString().padStart(2, "0")} UTC`;
+            sendTelegramSignal(
+              botToken,
+              chatId,
+              `🌐 <b>MARKET UPDATE</b>\n\n🟢 <b>${session.name} Session</b> is now OPEN.\n⏰ Time: <code>${timeString}</code>`,
+            ).catch(console.error);
+            sentSessionNotifications.add(key);
+          }
+        }
+
+        // Check end window (5 mins before to 5 mins after)
+        let isEndWindow = false;
+        if (session.end === 0) {
+          isEndWindow =
+            (utcHour === 23 && utcMinute >= 55) ||
+            (utcHour === 0 && utcMinute <= 5);
+        } else {
+          isEndWindow =
+            (utcHour === session.end - 1 && utcMinute >= 55) ||
+            (utcHour === session.end && utcMinute <= 5);
+        }
+
+        if (isEndWindow) {
+          const sessionDateStr =
+            utcHour === 23
+              ? new Date(now.getTime() + 86400000).toISOString().split("T")[0]
+              : dateStr;
+          const key = `${session.name}_END_${sessionDateStr}`;
+          if (!sentSessionNotifications.has(key)) {
+            const timeString = `${utcHour.toString().padStart(2, "0")}:${utcMinute.toString().padStart(2, "0")} UTC`;
+            sendTelegramSignal(
+              botToken,
+              chatId,
+              `🌐 <b>MARKET UPDATE</b>\n\n🔴 <b>${session.name} Session</b> is now CLOSED.\n⏰ Time: <code>${timeString}</code>`,
+            ).catch(console.error);
+            sentSessionNotifications.add(key);
+          }
+        }
+      }
+
+      // Cleanup old session notifications to prevent memory leak
+      if (sentSessionNotifications.size > 20) {
+        const oldKeys = Array.from(sentSessionNotifications).slice(0, 10);
+        oldKeys.forEach((k) => sentSessionNotifications.delete(k));
+      }
+      // -----------------------------
+
+      // Upgrade 4: Time-of-Day / Volume Weighting
+      const currentHour = new Date().getUTCHours();
+      const isAsianSession = currentHour >= 21 || currentHour < 8;
+      const requiredConfidence = 50; // Rank #1 Optimized threshold (from backtest: 50)
+      const sessionName = isAsianSession
+        ? "Asian (Low Vol)"
+        : "London/NY (High Vol)";
+
+      const topSymbols = await fetchTopSymbols();
+
+      const symbols = Array.from(
+        new Set([...topSymbols, ...Object.keys(activeTrades)]),
+      );
+      const allSignals: any[] = [];
+      const currentFrontendTrades: any[] = [];
+
+      // Upgrade 1: King Filter (BTC 15M Trend)
+      let btcTrend = "NEUTRAL";
+      try {
+        const btcKlines15m = await fetchKlines("BTCUSDT", "15m");
+        if (btcKlines15m.length >= 50) {
+          const btcCloses = btcKlines15m.map((k) => k.close);
+          const btcEma20 = EMA.calculate({ values: btcCloses, period: 20 });
+          const btcEma50 = EMA.calculate({ values: btcCloses, period: 50 });
+          const lastBtcClose = btcCloses[btcCloses.length - 1];
+          const lastBtcEma20 = btcEma20[btcEma20.length - 1];
+          const lastBtcEma50 = btcEma50[btcEma50.length - 1];
+          btcTrend =
+            lastBtcClose > lastBtcEma20 && lastBtcEma20 > lastBtcEma50
+              ? "LONG"
+              : lastBtcClose < lastBtcEma20 && lastBtcEma20 < lastBtcEma50
+                ? "SHORT"
+                : "NEUTRAL";
+        }
+      } catch (e) {
+        console.error("Failed to fetch BTC 15M trend for King Filter:", e);
+      }
+
+      // Process symbols simultaneously but with concurrency limit (e.g. 5 at a time) to prevent network choke
+      let diagnosticCounts = { total: symbols.length, htfNeutral: 0, veto1h: 0, mtfNoTrade: 0, mtfMismatch: 0, btcConflict: 0, ltfInvalid: 0, lowConfidence: 0 };
+      
+      const CONCURRENCY = 5;
+      for (let i = 0; i < symbols.length; i += CONCURRENCY) {
+        const chunk = symbols.slice(i, i + CONCURRENCY);
+        await Promise.all(chunk.map(async (symbol) => {
+          try {
+          // 1. Fetch 5M for active trade monitoring and sniper entry
+                // --- ACTIVE TRADE MONITORING (24/7) ---
+          const activeTrade = activeTrades[symbol];
+          const klines5m = await fetchKlines(symbol, "5m");
+          let tradeClosed = false;
+          if (activeTrade && klines5m.length > 0) {
+              // Check if pullback target is hit to average the entry
+              if (activeTrade.achieved > 0 && activeTrade.pullbackTarget && !activeTrade.hasHitPullback) {
+                const registeredAtVal = activeTrade.registeredAt || Date.now();
+                const recentCandles = klines5m.filter((c) => (c.time + 300) * 1000 >= registeredAtVal);
+                let hitPullback = false;
+                for (const candle of recentCandles) {
+                  if (activeTrade.direction === "LONG") {
+                    if (candle.low <= activeTrade.pullbackTarget) hitPullback = true;
+                  } else {
+                    if (candle.high >= activeTrade.pullbackTarget) hitPullback = true;
+                  }
+                  if (hitPullback) break;
+                }
+
+                if (hitPullback) {
+                  activeTrade.hasHitPullback = true;
+                  activeTrade.entry = (activeTrade.initialEntry + activeTrade.pullbackTarget) / 2;
+                  
+                  const directionIcon = activeTrade.direction === "LONG" ? "📈" : "📉";
+                  const entryAlertMsg = `🪙 Pair: #${symbol}
+${directionIcon} Direction: ${activeTrade.direction}
+💼 Status: DCA Pullback Hit! (Averaged Entry)
+🎯 New Averaged Entry: ${formatPrice(activeTrade.entry)}
+❌ Stop Loss: ${formatPrice(activeTrade.sl)}`;
+                  sendTelegramSignal(botToken, chatId, entryAlertMsg).catch(console.error);
+                }
+              }
+
+              // Evaluate active trade targets if filled
+              if (activeTrade.achieved >= 1) {
+                const registeredAtVal = activeTrade.registeredAt || Date.now();
+                const recentCandles = klines5m.filter((c) => (c.time + 300) * 1000 >= registeredAtVal);
+
+                // 1. Process SL and TP against historical 5m price action
+                for (const candle of recentCandles) {
+                  if (tradeClosed) break;
+
+                  const currentHigh = candle.high;
+                  const currentLow = candle.low;
+
+                  // Lookback protection: Avoid Same-Bar / Historical Wick violation
+                  const slCheckVal = (activeTrade.slUpdatedTime && (candle.time * 1000 < activeTrade.slUpdatedTime))
+                    ? activeTrade.sl // Retain original protective stop loss for retro-historical wicks
+                    : activeTrade.currentSl; // Apply the tightened trailing/break-even stop loss
+
+                  // 1. STOP LOSS CHECK (Priority 1)
+                  let slHit = false;
+                  if (activeTrade.direction === "LONG" && currentLow <= slCheckVal) {
+                    slHit = true;
+                  } else if (activeTrade.direction === "SHORT" && currentHigh >= slCheckVal) {
+                    slHit = true;
+                  }
+
+                  if (slHit) {
+                    if (activeTrade.direction === "LONG") {
+                      console.log(
+                        `[DEBUG] SL Hit for ${symbol}: Low ${currentLow}, SL ${slCheckVal}`,
+                      );
+                      const isBE = slCheckVal === activeTrade.entry;
+                      const pnlStr = isBE ? "0.00% (B/E Secured)" : calculatePnL(activeTrade.entry, slCheckVal, "LONG");
+                      const titleText = isBE ? "🛡 <b>BREAK-EVEN STOP LOSS HIT</b> 🛡" : "❌ <b>STOP LOSS HIT</b> ❌";
+                      const subtitleText = isBE ? "Rest of the position exited at cost." : "Position closed at protective Stop Loss.";
+
+                      sendTelegramSignal(
+                        botToken,
+                        chatId,
+                        `🚨 <b>TRADE UPDATE</b> 🚨\n\n🪙 <b>Pair:</b> #${symbol}\n📈 <b>Direction:</b> LONG\n${titleText}\n⚠️ <b>Status:</b> ${subtitleText} (Price: <code>${formatPrice(slCheckVal)}</code>)\n💰 <b>PnL Secured:</b> ${pnlStr}`,
+                      ).catch(console.error);
+                      
+                      recordTradeResult(isBE ? "WIN" : "LOSS");
+                      
+                      const remPortion = activeTrade.achieved === 1 ? 1.0 : (activeTrade.achieved === 2 ? 0.5 : (activeTrade.achieved === 3 ? 0.2 : 0.0));
+                      recordPnLSegment(calculatePnLNumber(activeTrade.entry, slCheckVal, "LONG"), remPortion, isBE ? "WIN" : "LOSS", activeTrade);
+                    } else {
+                      console.log(
+                        `[DEBUG] SL Hit for ${symbol}: High ${currentHigh}, SL ${slCheckVal}`,
+                      );
+                      const isBE = slCheckVal === activeTrade.entry;
+                      const pnlStr = isBE ? "0.00% (B/E Secured)" : calculatePnL(activeTrade.entry, slCheckVal, "SHORT");
+                      const titleText = isBE ? "🛡 <b>BREAK-EVEN STOP LOSS HIT</b> 🛡" : "❌ <b>STOP LOSS HIT</b> ❌";
+                      const subtitleText = isBE ? "Rest of the position exited at cost." : "Position closed at protective Stop Loss.";
+
+                      sendTelegramSignal(
+                        botToken,
+                        chatId,
+                        `🚨 <b>TRADE UPDATE</b> 🚨\n\n🪙 <b>Pair:</b> #${symbol}\n📉 <b>Direction:</b> SHORT\n${titleText}\n⚠️ <b>Status:</b> ${subtitleText} (Price: <code>${formatPrice(slCheckVal)}</code>)\n💰 <b>PnL Secured:</b> ${pnlStr}`,
+                      ).catch(console.error);
+                      
+                      recordTradeResult(isBE ? "WIN" : "LOSS");
+                      
+                      const remPortion = activeTrade.achieved === 1 ? 1.0 : (activeTrade.achieved === 2 ? 0.5 : (activeTrade.achieved === 3 ? 0.2 : 0.0));
+                      recordPnLSegment(calculatePnLNumber(activeTrade.entry, slCheckVal, "SHORT"), remPortion, isBE ? "WIN" : "LOSS", activeTrade);
+                    }
+                    delete activeTrades[symbol];
+                    tradeClosed = true;
+                    break;
+                  }
+
+                  // 4. TAKE PROFIT LOGIC (Priority 4, but evaluated tick-by-tick)
+                  if (!tradeClosed && activeTrade.direction === "LONG") {
+                    if (!activeTrade.hasHitTp1 && currentHigh >= activeTrade.tp1) {
+                      activeTrade.hasHitTp1 = true;
+                      activeTrade.achieved = 2;
+                      activeTrade.currentSl = activeTrade.entry; // Move SL to Break-Even!
+                      activeTrade.slUpdatedTime = Date.now();
+
+                      const pnlSegment = calculatePnL(activeTrade.entry, activeTrade.tp1, "LONG");
+                      recordPnLSegment(calculatePnLNumber(activeTrade.entry, activeTrade.tp1, "LONG"), 0.50, null, activeTrade);
+                      sendTelegramSignal(
+                        botToken,
+                        chatId,
+                        `🎯 <b>TAKE PROFIT 1 ACHIEVED (50% Booked)</b> 🎯\n\n🪙 <b>Pair:</b> #${symbol}\n📈 <b>Direction:</b> LONG\n✅ <b>Target 1:</b> <code>${formatPrice(activeTrade.tp1)}</code>\n💰 <b>Secured Return:</b> ${pnlSegment} (on 50% allocation)\n🛡 <b>Risk Management:</b> Stop Loss moved to Break-Even (<code>${formatPrice(activeTrade.entry)}</code>). Trade is now 100% risk-free!`,
+                      ).catch(console.error);
+                    } 
+                    if (activeTrade.hasHitTp1 && !activeTrade.hasHitTp2 && currentHigh >= activeTrade.tp2) {
+                      activeTrade.hasHitTp2 = true;
+                      activeTrade.achieved = 3;
+
+                      const pnlSegment = calculatePnL(activeTrade.entry, activeTrade.tp2, "LONG");
+                      recordPnLSegment(calculatePnLNumber(activeTrade.entry, activeTrade.tp2, "LONG"), 0.30, null, activeTrade);
+                      sendTelegramSignal(
+                        botToken,
+                        chatId,
+                        `🎯 <b>TAKE PROFIT 2 ACHIEVED (30% Booked)</b> 🎯\n\n🪙 <b>Pair:</b> #${symbol}\n📈 <b>Direction:</b> LONG\n✅ <b>Target 2:</b> <code>${formatPrice(activeTrade.tp2)}</code>\n💰 <b>Secured Return:</b> ${pnlSegment} (on 30% allocation)\n🏃‍♂️ <b>Next:</b> Remaining 20% position running risk-free to TP3 target!`,
+                      ).catch(console.error);
+                    } 
+                    if (activeTrade.hasHitTp2 && !activeTrade.hasHitTp3 && currentHigh >= activeTrade.tp3) {
+                      activeTrade.hasHitTp3 = true;
+                      activeTrade.achieved = 4;
+
+                      const pnlSegment = calculatePnL(activeTrade.entry, activeTrade.tp3, "LONG");
+                      sendTelegramSignal(
+                        botToken,
+                        chatId,
+                        `🎉 <b>TAKE PROFIT 3 ACHIEVED (Trade Completed)</b> 🎉\n\n🪙 <b>Pair:</b> #${symbol}\n📈 <b>Direction:</b> LONG\n✅ <b>Final Target:</b> <code>${formatPrice(activeTrade.tp3)}</code>\n💰 <b>Final Secured Return:</b> ${pnlSegment} (on remaining 20% runner)\n⭐️ <b>Status:</b> Trade successfully reached ultimate target! Enjoy the profits.`,
+                      ).catch(console.error);
+                      
+                      recordTradeResult("WIN");
+                      
+                      recordPnLSegment(calculatePnLNumber(activeTrade.entry, activeTrade.tp3, "LONG"), 0.20, "WIN", activeTrade);
+                      
+                      delete signalCooldowns[symbol]; // Allow new setups to be generated in this direction now that trade is successfully finished
+                      delete activeTrades[symbol];
+                      tradeClosed = true;
+                    }
+                  } else if (!tradeClosed && activeTrade.direction === "SHORT") {
+                    if (!activeTrade.hasHitTp1 && currentLow <= activeTrade.tp1) {
+                      activeTrade.hasHitTp1 = true;
+                      activeTrade.achieved = 2;
+                      activeTrade.currentSl = activeTrade.entry; // Move SL to Break-Even!
+                      activeTrade.slUpdatedTime = Date.now();
+
+                      const pnlSegment = calculatePnL(activeTrade.entry, activeTrade.tp1, "SHORT");
+                      recordPnLSegment(calculatePnLNumber(activeTrade.entry, activeTrade.tp1, "SHORT"), 0.50, null, activeTrade);
+                      sendTelegramSignal(
+                        botToken,
+                        chatId,
+                        `🎯 <b>TAKE PROFIT 1 ACHIEVED (50% Booked)</b> 🎯\n\n🪙 <b>Pair:</b> #${symbol}\n📉 <b>Direction:</b> SHORT\n✅ <b>Target 1:</b> <code>${formatPrice(activeTrade.tp1)}</code>\n💰 <b>Secured Return:</b> ${pnlSegment} (on 50% allocation)\n🛡 <b>Risk Management:</b> Stop Loss moved to Break-Even (<code>${formatPrice(activeTrade.entry)}</code>). Trade is now 100% risk-free!`,
+                      ).catch(console.error);
+                    } 
+                    if (activeTrade.hasHitTp1 && !activeTrade.hasHitTp2 && currentLow <= activeTrade.tp2) {
+                      activeTrade.hasHitTp2 = true;
+                      activeTrade.achieved = 3;
+
+                      const pnlSegment = calculatePnL(activeTrade.entry, activeTrade.tp2, "SHORT");
+                      recordPnLSegment(calculatePnLNumber(activeTrade.entry, activeTrade.tp2, "SHORT"), 0.30, null, activeTrade);
+                      sendTelegramSignal(
+                        botToken,
+                        chatId,
+                        `🎯 <b>TAKE PROFIT 2 ACHIEVED (30% Booked)</b> 🎯\n\n🪙 <b>Pair:</b> #${symbol}\n📉 <b>Direction:</b> SHORT\n✅ <b>Target 2:</b> <code>${formatPrice(activeTrade.tp2)}</code>\n💰 <b>Secured Return:</b> ${pnlSegment} (on 30% allocation)\n🏃‍♂️ <b>Next:</b> Remaining 20% position running risk-free to TP3 target!`,
+                      ).catch(console.error);
+                    } 
+                    if (activeTrade.hasHitTp2 && !activeTrade.hasHitTp3 && currentLow <= activeTrade.tp3) {
+                      activeTrade.hasHitTp3 = true;
+                      activeTrade.achieved = 4;
+
+                      const pnlSegment = calculatePnL(activeTrade.entry, activeTrade.tp3, "SHORT");
+                      sendTelegramSignal(
+                        botToken,
+                        chatId,
+                        `🎉 <b>TAKE PROFIT 3 ACHIEVED (Trade Completed)</b> 🎉\n\n🪙 <b>Pair:</b> #${symbol}\n📉 <b>Direction:</b> SHORT\n✅ <b>Final Target:</b> <code>${formatPrice(activeTrade.tp3)}</code>\n💰 <b>Final Secured Return:</b> ${pnlSegment} (on remaining 20% runner)\n⭐️ <b>Status:</b> Trade successfully reached ultimate target! Enjoy the profits.`,
+                      ).catch(console.error);
+                      
+                      recordTradeResult("WIN");
+                      
+                      recordPnLSegment(calculatePnLNumber(activeTrade.entry, activeTrade.tp3, "SHORT"), 0.20, "WIN", activeTrade);
+                      
+                      delete signalCooldowns[symbol]; // Allow new setups to be generated in this direction now that trade is successfully finished
+                      delete activeTrades[symbol];
+                      tradeClosed = true;
+                    }
+                  }
+                } // End of recentCandles loop
+              }
+          }
+          if (tradeClosed) {
+            // Keep signalCooldowns intact so we don't immediately reprint the same setup again
+            // after an exit just because the indicators haven't fully reversed yet.
+            return; // Skip generating new signals if a trade just closed on this tick
+          }
+          // --- END ACTIVE TRADE MONITORING ---
+
+          // We continue to MTF analysis to evaluate strategy upgrades and opposite-direction signals
+            // 2. 4H Bias Alignment
+            const klines4h = await fetchKlines(symbol, "4h");
+            const htfDirection = getHTFDirection(klines4h);
+            const strictHtfAlignment = true; // Best Config: strict HTF alignment
+            const htfNeutralSkip = true; // Best Config: skip NEUTRAL
+            if (htfNeutralSkip && htfDirection === "NEUTRAL") { diagnosticCounts.htfNeutral++; return; }
+
+            // 2.5 1H Control Layer
+            const klines1h = await fetchKlines(symbol, "1h");
+            const htfBiasFor1H = htfDirection === "NEUTRAL" ? "LONG" : htfDirection;
+            const control1H = get1HControlState(klines1h, htfBiasFor1H);
+            const use1hControl = true; // Best Config: use 1H control filter
+            if (use1hControl && control1H.state === "WAIT") {
+               console.log(`[Reject] ${symbol}: 1H Control is WAIT`);
+               return; 
+            }
+            if (use1hControl && control1H.state === "VETO") {
+               console.log(`[Reject] ${symbol}: 1H Control is VETO`);
+               return; 
+            }
+
+            // 3. 15M Confirmation (Confidence/Setup)
+            const klines15m = await fetchKlines(symbol, "15m");
+            const mtfAnalysis = analyzeChart(
+              klines15m,
+              DEFAULT_RELIABILITY,
+              [],
+              symbol,
+            );
+            if (mtfAnalysis.signal === "NO TRADE") { diagnosticCounts.mtfNoTrade++; return; }
+            if (strictHtfAlignment && htfDirection !== mtfAnalysis.signal) { diagnosticCounts.mtfMismatch++; return; }
+
+            // Upgrade 1: King Filter Application
+            const useBtcFilter = true; // Best Config: enabled
+            if (useBtcFilter && symbol !== "BTCUSDT") {
+              // Altcoin LONG allowed only if BTC not bearish (LONG or NEUTRAL)
+              if (mtfAnalysis.signal === "LONG" && btcTrend === "SHORT") { 
+                diagnosticCounts.btcConflict++; 
+                console.log(`[Reject] ${symbol}: BTC Conflict (Direction: ${mtfAnalysis.signal}, BTC: ${btcTrend})`);
+                return; 
+              }
+              // Altcoin SHORT allowed only if BTC is not strongly bullish (SHORT or NEUTRAL)
+              if (mtfAnalysis.signal === "SHORT" && btcTrend === "LONG") { 
+                diagnosticCounts.btcConflict++; 
+                console.log(`[Reject] ${symbol}: BTC Conflict (Direction: ${mtfAnalysis.signal}, BTC: ${btcTrend})`);
+                return; 
+              }
+            }
+
+            // 4. 5M Entry Validation
+            const ltfValidation = validateLTFEntry(
+              klines5m,
+              mtfAnalysis.signal as "LONG" | "SHORT",
+            );
+            if (!ltfValidation.isValid) { 
+              diagnosticCounts.ltfInvalid++; 
+              console.log(`[Reject] ${symbol}: LTF Invalid (${ltfValidation.reason})`);
+              return; 
+            }
+
+            // Calculate dynamic limit entry with pullback factor of 0.45 (Rank #1 Optimized Setting)
+            const originalClose = klines5m.length > 0 ? klines5m[klines5m.length - 1].close : 0;
+            const sl = mtfAnalysis.sl || (mtfAnalysis.signal === "LONG" ? originalClose * 0.98 : originalClose * 1.02);
+            const gap = Math.abs(originalClose - sl);
+            const pullbackFactor = 0.45; // 45% Pullback from backtest Rank #1
+            const shift = gap * pullbackFactor;
+            
+            mtfAnalysis.limitEntry = mtfAnalysis.signal === "LONG" ? originalClose - shift : originalClose + shift;
+            mtfAnalysis.entryStrategy = "Limit (Pullback)";
+
+            // Premium Upgrades: OI and Funding Rate
+            let premiumLogicStr = "";
+            try {
+              if (control1H.state === "CONTINUATION") {
+                const oiRes = await fetchWithTimeout(
+                  `https://fapi.binance.com/futures/data/openInterestHist?symbol=${symbol}&period=15m&limit=2`,
+                  { timeout: 10000 },
+                  'INDICATOR'
+                );
+                if (!oiRes.headers.get("content-type")?.includes("application/json")) {
+                  throw new Error("Binance HTML error");
+                }
+                const oiData = await oiRes.json();
+                if (Array.isArray(oiData) && oiData.length === 2) {
+                  const prev = parseFloat(oiData[0].sumOpenInterestValue);
+                  const curr = parseFloat(oiData[1].sumOpenInterestValue);
+                  if (prev > 0) {
+                    const oiChange = (curr - prev) / prev;
+                    if (oiChange > 0.001) {
+                      // > 0.1% increase in 15m
+                      // mtfAnalysis.confidence += 5;
+                      premiumLogicStr += `\n• 🔥 Trend Fuel: OI Rising`;
+                    }
+                  }
+                }
+              } else if (control1H.state === "WAIT") {
+                const frRes = await fetchWithTimeout(
+                  `https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${symbol}`,
+                  { timeout: 10000 },
+                  'INDICATOR'
+                );
+                if (!frRes.headers.get("content-type")?.includes("application/json")) {
+                  throw new Error("Binance HTML error");
+                }
+                const frData = await frRes.json();
+                const fundingRate = parseFloat(frData.lastFundingRate);
+
+                if (mtfAnalysis.signal === "LONG" && fundingRate < -0.0001) {
+                  // mtfAnalysis.confidence += 8;
+                  premiumLogicStr += `\n• 💥 Squeeze Hunter: Negative Funding Rate`;
+                } else if (
+                  mtfAnalysis.signal === "SHORT" &&
+                  fundingRate > 0.0005
+                ) {
+                  // mtfAnalysis.confidence += 8;
+                  premiumLogicStr += `\n• 💥 Squeeze Hunter: High Positive Funding Rate`;
+                }
+              }
+            } catch (e) {
+              console.error(`Failed to fetch premium data for ${symbol}:`, e);
+            }
+            (mtfAnalysis as any).premiumLogicStr = premiumLogicStr;
+
+            // Cap confidence at 100 after premium upgrades
+            mtfAnalysis.confidence = Math.min(100, mtfAnalysis.confidence);
+
+            // 5. Combine and Send
+            if (mtfAnalysis.confidence >= requiredConfidence) {
+              const signalKey = `${symbol}-Multi-TF (4h, 15m, 5m)`;
+              
+              const entryPrice = klines5m.length > 0 ? klines5m[klines5m.length - 1].close : 0;
+              const tp = mtfAnalysis.tp || 0;
+              const sl = mtfAnalysis.sl || 0;
+
+              currentFrontendTrades.push({
+                symbol,
+                analysis: mtfAnalysis,
+                lastPrice: entryPrice,
+                entryDirection: 'none'
+              });
+
+              const direction = mtfAnalysis.signal as "LONG" | "SHORT";
+              const lastSignal = signalCooldowns[symbol];
+              let shouldSend = true;
+              let isUpgrade = false;
+              let oldConfidence = 0;
+
+              // 1. Block duplicate signals if a trade is already active in the same direction
+              if (activeTrades[symbol] && activeTrades[symbol].direction === direction) {
+                  shouldSend = false;
+              }
+
+              // 2. Time-based Cooldowns (Evaluate if shouldSend hasn't been blocked yet)
+              if (shouldSend && lastSignal) {
+                  if (lastSignal.direction === direction) {
+                      // Extended cooldown (4 hours) for same-direction repeated signals 
+                      // to prevent spamming if the market just ranges on the setup
+                      if (Date.now() - lastSignal.timestamp < 4 * 60 * 60 * 1000) {
+                          if (mtfAnalysis.confidence - lastSignal.confidence >= 5) {
+                              isUpgrade = true; // Signal Upgrade
+                              oldConfidence = lastSignal.confidence;
+                          } else {
+                              shouldSend = false; // Block duplicate
+                          }
+                      }
+                  } else {
+                      // Opposite direction! Cooldown does not apply.
+                      shouldSend = true;
+                  }
+              }
+
+              if (shouldSend) {
+                  signalCooldowns[symbol] = {
+                      timestamp: Date.now(),
+                      direction,
+                      confidence: mtfAnalysis.confidence
+                  };
+                  allSignals.push({
+                    symbol,
+                    signalKey,
+                    analysis: mtfAnalysis,
+                    entryPrice,
+                    tp,
+                    sl,
+                    control1H,
+                    sessionName,
+                    isUpgrade,
+                    oldConfidence
+                  });
+              }
+            } else {
+              diagnosticCounts.lowConfidence++;
+            }
+          } catch (err) {
+            console.error(
+              `Error processing symbol ${symbol} in background loop:`,
+              err,
+            );
+          }
+        })); // End of chunk Promise.all mappings
+        
+        // Add a 1-second delay between chunks to avoid Binance burst rate limting (429 Too Many Requests)
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      } // End of chunk loop
+
+      // --- SIGNAL FILTERING & SENDING ---
+      if (allSignals.length > 0) {
+        for (const sig of allSignals) {
+          const isLimit = !!sig.analysis.limitEntry;
+          const entryPrice = sig.analysis.limitEntry || sig.entryPrice;
+          
+          // Compute correct progressive targets relative to the target entry
+          const riskAmount = Math.abs(entryPrice - sig.sl);
+          const dirMulti = sig.analysis.signal === "LONG" ? 1 : -1;
+          const tp1 = entryPrice + (dirMulti * riskAmount * 1.8);
+          const tp2 = entryPrice + (dirMulti * riskAmount * 3.0);
+          const tp3 = entryPrice + (dirMulti * riskAmount * 5.0);
+
+          // Determine if limit is distinctly set
+          const isLimitTrue = isLimit && sig.analysis.limitEntry !== sig.entryPrice;
+
+          const sessionInd = sig.analysis.indicators.find((i: any) => i.name === 'Session Killzone');
+          const sessionName = sessionInd ? sessionInd.value : "OUTSIDE";
+
+          if (!sig.isUpgrade || !activeTrades[sig.symbol]) {
+              activeTrades[sig.symbol] = {
+                symbol: sig.symbol,
+                direction: sig.analysis.signal as "LONG" | "SHORT",
+                entry: entryPrice,
+                tp: sig.tp,
+                tp1,
+                tp2,
+                tp3,
+                sl: sig.sl,
+                currentSl: sig.sl,
+                achieved: 1, // Start active directly at market! 100% signals traded. 
+                isLimitEntry: isLimitTrue,
+                pullbackTarget: isLimitTrue ? sig.analysis.limitEntry : undefined,
+                hasHitPullback: false,
+                initialEntry: entryPrice,
+                hasHitTp1: false,
+                hasHitTp2: false,
+                hasHitTp3: false,
+                registeredAt: Date.now(),
+                confidence: sig.analysis.confidence || 0,
+                session: sessionName,
+              };
+          } else {
+              activeTrades[sig.symbol].confidence = sig.analysis.confidence;
+          }
+
+          const directionEmoji =
+            sig.analysis.signal === "LONG" ? "🟢 LONG" : "🔴 SHORT";
+          const escapeHtml = (text: string) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+          const strategyStr = sig.analysis.entryStrategy
+            ? `\n\n📝 Strategy: ${escapeHtml(sig.analysis.entryStrategy)}`
+            : "";
+
+          const logicStrRaw =
+            sig.analysis.indicators
+              .filter(
+                (i: any) =>
+                  i.signal ===
+                  (sig.analysis.signal === "LONG" ? "bullish" : "bearish"),
+              )
+              .map((i: any) => `• ${i.name}: ${i.description}`)
+              .join("\n") + ((sig.analysis as any).premiumLogicStr || "");
+              
+          const logicStr = escapeHtml(logicStrRaw);
+
+          const sizeModel = getSizingModel();
+          const streakSign = sizeModel.consecutiveStreak > 0 ? "+" : "";
+          const riskSizingStr = `\n\n🔥 Current Streak: <b>${streakSign}${sizeModel.consecutiveStreak}</b> consecutive ${sizeModel.consecutiveStreak > 0 ? "wins" : "losses"}\n📊 Sizing Modifier: <code>${sizeModel.mStreak.toFixed(2)}x</code>\n💰 Recommended Kelly Allocation: <b>${sizeModel.recommendedSizingPercent.toFixed(1)}%</b> of Portfolio (Quarter-Kelly)`;
+
+          let message = "";
+          const directionIcon = sig.analysis.signal === "LONG" ? "📈" : "📉";
+          const confValue = (sig.analysis.confidence || 0).toFixed(1);
+          if (sig.isUpgrade) {
+              const oldConfValue = (sig.oldConfidence || 0).toFixed(1);
+              message = `🔄 <b>Signal Upgrade</b>\n\n🪙 Pair: #${sig.symbol}\n${directionIcon} Direction: ${sig.analysis.signal}\n\n📈 Confidence: ${oldConfValue}% → ${confValue}%\n\n📝 Reason:\n${logicStr}\n${strategyStr}${riskSizingStr}`;
+          } else if (isLimitTrue) {
+            message = `🪙 Pair: #${sig.symbol}
+${directionIcon} Direction: ${sig.analysis.signal}
+  Confidence: ${confValue}%
+🎯 Entry Price: ${formatPrice(sig.entryPrice)}
+🎯 Limit Entry Price: ${formatPrice(entryPrice)}
+🎯 TP1 (50% Booking): ${formatPrice(tp1)}
+🎯 TP2 (30% Booking): ${formatPrice(tp2)}
+🎯 TP3 (20% Runner): ${formatPrice(tp3)}
+❌ Stop Loss: ${formatPrice(sig.sl)}
+🛡 Trail Mode: Move SL to Break-Even at TP1${riskSizingStr}`;
+          } else {
+            message = `🪙 Pair: #${sig.symbol}
+${directionIcon} Direction: ${sig.analysis.signal}
+  Confidence: ${confValue}%
+🎯 Entry Price: ${formatPrice(entryPrice)}
+🎯 TP1 (50% Booking): ${formatPrice(tp1)}
+🎯 TP2 (30% Booking): ${formatPrice(tp2)}
+🎯 TP3 (20% Runner): ${formatPrice(tp3)}
+❌ Stop Loss: ${formatPrice(sig.sl)}
+🛡 Trail Mode: Move SL to Break-Even at TP1${riskSizingStr}`;
+          }
+
+          const bullishImageUrl =
+            "https://quickchart.io/chart?c=" + encodeURIComponent("{type:'line',data:{labels:['1','2','3','4','5','6','7'],datasets:[{label:'Bullish',data:[10,15,13,22,18,28,35],borderColor:'rgb(16,185,129)',backgroundColor:'rgba(16,185,129,0.2)',fill:true}]},options:{legend:{display:false},scales:{xAxes:[{display:false}],yAxes:[{display:false}]}}}");
+          const bearishImageUrl =
+            "https://quickchart.io/chart?c=" + encodeURIComponent("{type:'line',data:{labels:['1','2','3','4','5','6','7'],datasets:[{label:'Bearish',data:[35,28,32,20,24,15,10],borderColor:'rgb(244,63,94)',backgroundColor:'rgba(244,63,94,0.2)',fill:true}]},options:{legend:{display:false},scales:{xAxes:[{display:false}],yAxes:[{display:false}]}}}");
+          const imageUrl =
+            sig.analysis.signal === "LONG" ? bullishImageUrl : bearishImageUrl;
+
+          sendTelegramSignal(botToken, chatId, message, imageUrl).catch(console.error);
+
+          // Webhook Engine Auto-Dispatch
+          try {
+            const whConfig = getWebhookConfig();
+            if (whConfig.enabled && whConfig.autoDispatch && whConfig.webhookUrl) {
+              const reqConf = whConfig.minConfidence || 80;
+              if (sig.analysis.confidence >= reqConf) {
+                dispatchWebhookSignal({
+                  symbol: sig.symbol,
+                  direction: sig.analysis.signal as any,
+                  entryPrice: sig.entryPrice,
+                  limitEntry: sig.analysis.limitEntry,
+                  sl: sig.sl,
+                  tp: sig.tp,
+                  tp1,
+                  tp2,
+                  tp3,
+                  confidence: sig.analysis.confidence,
+                  analysis: sig.analysis,
+                  timeframe: "15m",
+                  session: sessionName,
+                }).then((whRes) => {
+                  if (whRes.success) {
+                    console.log(`🚀 [Webhook Engine] Successfully auto-dispatched ${sig.analysis.signal} signal for ${sig.symbol} to ${whConfig.webhookUrl}`);
+                  } else {
+                    console.warn(`⚠️ [Webhook Engine] Auto-dispatch failed for ${sig.symbol}: ${whRes.message}`);
+                  }
+                }).catch((whErr) => {
+                  console.error(`[Webhook Engine Error] Failed to auto-dispatch ${sig.symbol}:`, whErr);
+                });
+              }
+            }
+          } catch (whErr) {
+            console.error("[Webhook Engine Error]", whErr);
+          }
+          
+          loadDailyPnLState();
+          dailyPnLState.signalsGenerated++;
+          saveDailyPnLState();
+        }
+      }
+
+      // Update frontend table
+      const frontendTradesMap = new Map<string, any>();
+      for (const t of globalFrontendTrades) {
+        frontendTradesMap.set(t.symbol, t);
+      }
+      for (const t of currentFrontendTrades) {
+        frontendTradesMap.set(t.symbol, t);
+      }
+      const newGlobalTrades = Array.from(frontendTradesMap.values());
+      newGlobalTrades.sort((a, b) => b.analysis.confidence - a.analysis.confidence);
+      globalFrontendTrades = newGlobalTrades.slice(0, 15);
+      
+      const cooldowns: Record<string, number> = {};
+      const nowMs = Date.now();
+      for (const [sym, state] of Object.entries(signalCooldowns)) {
+        const remaining = 60 * 60 * 1000 - (nowMs - state.timestamp);
+        if (remaining > 0) {
+          cooldowns[sym] = Math.ceil(remaining / 1000); // remaining seconds
+        }
+      }
+
+      lastScanMetrics = {
+          timestamp: Date.now(),
+          symbolsCount: symbols.length,
+          btcTrend,
+          diagnosticCounts,
+          signalCandidatesCount: allSignals.length,
+          cooldowns
+      };
+
+      if ((global as any).broadcastToClients) {
+          (global as any).broadcastToClients({ type: 'top-trades', payload: globalFrontendTrades });
+          // Note: Since multiAnalysis uses the indicators from top-trades analysis, 
+          // we can also extract indicators or just let frontend extract it.
+      }
+
+    } catch (err) {
+      console.error("Error in background loop:", err);
+    } finally {
+      saveScannerState();
+      setTimeout(runBackgroundLoop, 60000); // Check every minute
+    }
+  };
+  // Sequential Cache pre-warmup routine at server boot to stay 100% compliant with API Limits
+  console.log("🌟 [Warmup] Initiating background pre-warmup stage for top volume coin markets...");
+  (async () => {
+    try {
+      const topSymbols = await fetchTopSymbols();
+      console.log(`[Warmup] Retrieved ${topSymbols.length} core symbols. Spreading REST api warmups to respect limits.`);
+      for (let sIdx = 0; sIdx < topSymbols.length; sIdx++) {
+         const symbol = topSymbols[sIdx];
+         const timeframes = ["5m", "15m", "1h", "4h"];
+         console.log(`[Warmup] Loading [${sIdx + 1}/${topSymbols.length}] ${symbol} indicators...`);
+         for (const tf of timeframes) {
+             try {
+                await fetchKlines(symbol, tf);
+                // Introduce 150ms sequential gap to avoid burst fatigue on API
+                await new Promise((resolve) => setTimeout(resolve, 150));
+             } catch (wErr: any) {
+                console.error(`[Warmup Warning] Minor issue on ${symbol} ${tf}:`, wErr.message);
+             }
+         }
+      }
+      console.log("🌟 [Warmup] Sequential cache warmup completely finalized! Real-time WS handlers will hold cache hot.");
+    } catch (warmupErr) {
+      console.error("[Warmup Fatal] Cache pre-warm up failed:", warmupErr);
+    }
+  })();
+
+  runBackgroundLoop(); // Enable 24/7 background Telegram scanning
+
+  // Vite middleware for development
+  if (process.env.NODE_ENV !== "production") {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), "dist");
+    app.use(express.static(distPath));
+    app.get("*", (req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
+    });
+  }
+
+  const httpServer = app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+  });
+
+  const { WebSocketServer } = await import('ws');
+  const wss = new WebSocketServer({ server: httpServer });
+
+  const clientSubscriptions = new Map<any, { symbol: string, interval: string }[]>();
+
+  wss.on('connection', (ws) => {
+    console.log('Client connected to WebSocket');
+    
+    // Send current active trades immediately
+    ws.send(JSON.stringify({ type: 'top-trades', data: Object.values(activeTrades) }));
+
+    ws.on('message', (message) => {
+      try {
+        const msg = JSON.parse(message.toString());
+        if (msg.type === 'subscribe') {
+           const subs = clientSubscriptions.get(ws) || [];
+           subs.push({ symbol: msg.symbol, interval: msg.interval });
+           clientSubscriptions.set(ws, subs);
+           subscribeToWs(msg.symbol, msg.interval);
+           
+           fetchKlines(msg.symbol, msg.interval).then(klines => {
+              try {
+                const analysis = analyzeChart(klines, undefined, [], msg.symbol, msg.interval);
+                ws.send(JSON.stringify({ type: 'market-data', symbol: msg.symbol, interval: msg.interval, data: klines, indicators: analysis }));
+              } catch (e) { console.error(e) }
+           });
+        } else if (msg.type === 'unsubscribe') {
+           let subs = clientSubscriptions.get(ws) || [];
+           subs = subs.filter(s => !(s.symbol === msg.symbol && s.interval === msg.interval));
+           clientSubscriptions.set(ws, subs);
+        }
+      } catch(e){}
+    });
+
+    ws.on('close', () => {
+      clientSubscriptions.delete(ws);
+      console.log('Client disconnected');
+    });
+  });
+
+  (global as any).clientSubscriptions = clientSubscriptions;
+
+  // Make wss accessible to other functions if needed, or broadcast from runBackgroundLoop
+  // Oh wait, I can just export or pass it, but since it's inside startServer I'll just use a local reference
+  // We can inject a lightweight broadcast function.
+  (global as any).broadcastToClients = (payload: any) => {
+    wss.clients.forEach((client) => {
+      if (client.readyState === 1) { // WebSocket.OPEN
+        client.send(JSON.stringify(payload));
+      }
+    });
+  };
+}
+
+startServer();
